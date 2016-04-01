@@ -6211,6 +6211,7 @@ void TABLE::mark_auto_increment_column()
 
 void TABLE::mark_columns_needed_for_delete()
 {
+  bool need_signal= false;
   mark_columns_per_binlog_row_image();
 
   if (triggers)
@@ -6223,7 +6224,7 @@ void TABLE::mark_columns_needed_for_delete()
       if ((*reg_field)->flags & PART_KEY_FLAG)
         bitmap_set_bit(read_set, (*reg_field)->field_index);
     }
-    file->column_bitmaps_signal();
+    need_signal= true;
   }
   if (file->ha_table_flags() & HA_PRIMARY_KEY_REQUIRED_FOR_DELETE)
   {
@@ -6237,11 +6238,17 @@ void TABLE::mark_columns_needed_for_delete()
     else
     {
       mark_columns_used_by_index_no_reset(s->primary_key, read_set);
-      file->column_bitmaps_signal();
+      need_signal= true;
     }
   }
   if (check_constraints)
+  {
     mark_check_constraint_columns_for_read();
+    need_signal= true;
+  }
+
+  if (need_signal)
+    file->column_bitmaps_signal();
 }
 
 
@@ -6266,6 +6273,7 @@ void TABLE::mark_columns_needed_for_delete()
 void TABLE::mark_columns_needed_for_update()
 {
   DBUG_ENTER("mark_columns_needed_for_update");
+  bool need_signal= false;
 
   mark_columns_per_binlog_row_image();
 
@@ -6281,7 +6289,7 @@ void TABLE::mark_columns_needed_for_update()
       if (merge_keys.is_overlapping((*reg_field)->part_of_key))
         bitmap_set_bit(read_set, (*reg_field)->field_index);
     }
-    file->column_bitmaps_signal();
+    need_signal= true;
   }
   if (file->ha_table_flags() & HA_PRIMARY_KEY_REQUIRED_FOR_DELETE)
   {
@@ -6295,16 +6303,19 @@ void TABLE::mark_columns_needed_for_update()
     else
     {
       mark_columns_used_by_index_no_reset(s->primary_key, read_set);
-      file->column_bitmaps_signal();
+      need_signal= true;
     }
   }
   if (default_field)
     mark_default_fields_for_write(FALSE);
   /* Mark all virtual columns needed for update */
   if (vfield)
-    mark_virtual_columns_for_write(FALSE);
+    need_signal|= mark_virtual_columns_for_write(FALSE);
   if (check_constraints)
+  {
     mark_check_constraint_columns_for_read();
+    need_signal= true;
+  }
 
   /*
     If a timestamp field settable on UPDATE is present then to avoid wrong
@@ -6313,7 +6324,12 @@ void TABLE::mark_columns_needed_for_update()
   */
   if ((file->ha_table_flags() & HA_PARTIAL_COLUMN_READ) &&
       default_field && s->has_update_default_function)
+  {
     bitmap_union(read_set, write_set);
+    need_signal= true;
+  }
+  if (need_signal)
+    file->column_bitmaps_signal();
   DBUG_VOID_RETURN;
 }
 
@@ -6516,7 +6532,7 @@ bool TABLE::mark_virtual_col(Field *field)
     through columns from write_set it is also marked in vcol_set, and,
     besides, it is added to write_set. 
 
-  @return       void
+  @return whether a bitmap was updated
 
   @note
     Let table t1 have columns a,b,c and let column c be a stored virtual 
@@ -6529,7 +6545,7 @@ bool TABLE::mark_virtual_col(Field *field)
     be added to read_set either.
 */
 
-void TABLE::mark_virtual_columns_for_write(bool insert_fl)
+bool TABLE::mark_virtual_columns_for_write(bool insert_fl)
 {
   Field **vfield_ptr, *tmp_vfield;
   bool bitmap_updated= FALSE;
@@ -6544,14 +6560,10 @@ void TABLE::mark_virtual_columns_for_write(bool insert_fl)
       bool mark_fl= insert_fl;
       if (!mark_fl)
       {
-        MY_BITMAP *save_read_set;
         Item *vcol_item= tmp_vfield->vcol_info->expr_item;
         DBUG_ASSERT(vcol_item);
         bitmap_clear_all(&tmp_set);
-        save_read_set= read_set;
-        read_set= &tmp_set;
-        vcol_item->walk(&Item::register_field_in_read_map, 1, 0);
-        read_set= save_read_set;
+        vcol_item->walk(&Item::register_field_in_bitmap, 1, (uchar*)&tmp_set);
         bitmap_intersect(&tmp_set, write_set);
         mark_fl= !bitmap_is_clear_all(&tmp_set);
       }
@@ -6565,6 +6577,7 @@ void TABLE::mark_virtual_columns_for_write(bool insert_fl)
   }
   if (bitmap_updated)
     file->column_bitmaps_signal();
+  return bitmap_updated;
 }
 
 /*
@@ -7258,12 +7271,6 @@ bool is_simple_order(ORDER *order)
   @details
     The function computes the values of the virtual columns of the table and
     stores them in the table record buffer.
-    If vcol_update_mode is set to VCOL_UPDATE_ALL then all virtual column are
-    computed.
-    If vcol_update_mode is set to VCOL_UPDATE_FOR_WRITE then all
-    fields that are set in vcol_set are updated.
-    If vcol_update_mode is set to VCOL_UPDATE_FOR_READ then all
-    fields that are set in vcol_set and are not stored are updated.
 
   @retval
     0    Success
@@ -7276,8 +7283,8 @@ int update_virtual_fields(THD *thd, TABLE *table,
 {
   DBUG_ENTER("update_virtual_fields");
   Field **vfield_ptr, *vfield;
-  int error __attribute__ ((unused))= 0;
-  DBUG_ASSERT(table && table->vfield);
+  DBUG_ASSERT(table);
+  DBUG_ASSERT(table->vfield);
 
   thd->reset_arena_for_cached_items(table->expr_arena);
   /* Iterate over virtual fields in the table */
@@ -7287,13 +7294,28 @@ int update_virtual_fields(THD *thd, TABLE *table,
     Virtual_column_info *vcol_info= vfield->vcol_info;
     DBUG_ASSERT(vcol_info);
     DBUG_ASSERT(vcol_info->expr_item);
-    if ((bitmap_is_set(table->vcol_set, vfield->field_index) &&
-         (vcol_update_mode == VCOL_UPDATE_FOR_WRITE ||
-          !vcol_info->stored_in_db)) ||
-        vcol_update_mode == VCOL_UPDATE_ALL)
+
+    bool update;
+    switch (vcol_update_mode) {
+    case VCOL_UPDATE_FOR_READ_WRITE:
+      if (table->triggers)
+      {
+        update= true;
+        break;
+      }
+    case VCOL_UPDATE_FOR_READ:
+      update= !vcol_info->stored_in_db
+           && bitmap_is_set(table->vcol_set, vfield->field_index);
+      break;
+    case VCOL_UPDATE_FOR_WRITE:
+      update= table->triggers || bitmap_is_set(table->vcol_set, vfield->field_index);
+      break;
+    }
+
+    if (update)
     {
       /* Compute the actual value of the virtual fields */
-      error= vcol_info->expr_item->save_in_field(vfield, 0);
+      vcol_info->expr_item->save_in_field(vfield, 0);
       DBUG_PRINT("info", ("field '%s' - updated", vfield->field_name));
     }
     else
