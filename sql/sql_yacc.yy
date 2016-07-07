@@ -709,20 +709,6 @@ bool LEX::add_select_to_union_list(bool is_union_distinct,
 }
 
 
-static bool add_create_index_prepare(LEX *lex, Table_ident *table)
-{
-  lex->sql_command= SQLCOM_CREATE_INDEX;
-  if (!lex->current_select->add_table_to_list(lex->thd, table, NULL,
-                                              TL_OPTION_UPDATING,
-                                              TL_READ_NO_INSERT,
-                                              MDL_SHARED_UPGRADABLE))
-    return TRUE;
-  lex->alter_info.reset();
-  lex->alter_info.flags= Alter_info::ALTER_ADD_INDEX;
-  lex->option_list= NULL;
-  return FALSE;
-}
-
 
 /**
   Create a separate LEX for each assignment if in SP.
@@ -833,12 +819,11 @@ static bool sp_create_assignment_instr(THD *thd, bool no_lookahead)
   return false;
 }
 
-
-static void add_key_to_list(LEX *lex, LEX_STRING *field_name,
-                            enum Key::Keytype type, bool check_exists)
+void LEX::add_key_to_list(LEX_STRING *field_name,
+                          enum Key::Keytype type, bool check_exists)
 {
   Key *key;
-  MEM_ROOT *mem_root= lex->thd->mem_root;
+  MEM_ROOT *mem_root= thd->mem_root;
   key= new (mem_root)
         Key(type, null_lex_str, HA_KEY_ALG_UNDEF, false,
              DDL_options(check_exists ?
@@ -846,7 +831,7 @@ static void add_key_to_list(LEX *lex, LEX_STRING *field_name,
                          DDL_options::OPT_NONE));
   key->columns.push_back(new (mem_root) Key_part_spec(*field_name, 0),
                          mem_root);
-  lex->alter_info.key_list.push_back(key, mem_root);
+  alter_info.key_list.push_back(key, mem_root);
 }
 
 void LEX::init_last_field(Column_definition *field, const char *field_name,
@@ -2578,7 +2563,7 @@ create:
           opt_key_algorithm_clause
           ON table_ident
           {
-            if (add_create_index_prepare(Lex, $8))
+            if (Lex->add_create_index_prepare($8))
               MYSQL_YYABORT;
             if (Lex->add_create_index($2, $5, $6, $1 | $4))
               MYSQL_YYABORT;
@@ -2588,7 +2573,7 @@ create:
         | create_or_replace fulltext INDEX_SYM opt_if_not_exists ident
           ON table_ident
           {
-            if (add_create_index_prepare(Lex, $7))
+            if (Lex->add_create_index_prepare($7))
               MYSQL_YYABORT;
             if (Lex->add_create_index($2, $5, HA_KEY_ALG_UNDEF, $1 | $4))
               MYSQL_YYABORT;
@@ -2598,7 +2583,7 @@ create:
         | create_or_replace spatial INDEX_SYM opt_if_not_exists ident
           ON table_ident
           {
-            if (add_create_index_prepare(Lex, $7))
+            if (Lex->add_create_index_prepare($7))
               MYSQL_YYABORT;
             if (Lex->add_create_index($2, $5, HA_KEY_ALG_UNDEF, $1 | $4))
               MYSQL_YYABORT;
@@ -6162,9 +6147,9 @@ field_spec:
 
             $$->create_if_not_exists= Lex->check_exists;
             if ($$->flags & PRI_KEY_FLAG)
-              add_key_to_list(lex, &$1, Key::PRIMARY, Lex->check_exists);
+              lex->add_key_to_list(&$1, Key::PRIMARY, lex->check_exists);
             else if ($$->flags & UNIQUE_KEY_FLAG)
-              add_key_to_list(lex, &$1, Key::UNIQUE, Lex->check_exists);
+              lex->add_key_to_list(&$1, Key::UNIQUE, lex->check_exists);
           }
         ;
 
