@@ -347,58 +347,6 @@ set_local_variable(THD *thd, sp_variable *spv, Item *val)
 
 
 /**
-  Helper action for a SET statement.
-  Used to SET a field of NEW row.
-
-  @param thd      the current thread
-  @param name     the field name
-  @param val      the value being assigned to the row
-
-  @return TRUE if error, FALSE otherwise.
-*/
-
-static bool
-set_trigger_new_row(THD *thd, LEX_STRING *name, Item *val)
-{
-  LEX *lex= thd->lex;
-  Item_trigger_field *trg_fld;
-  sp_instr_set_trigger_field *sp_fld;
-
-  /* QQ: Shouldn't this be field's default value ? */
-  if (! val)
-    val= new (thd->mem_root) Item_null(thd);
-
-  DBUG_ASSERT(lex->trg_chistics.action_time == TRG_ACTION_BEFORE &&
-              (lex->trg_chistics.event == TRG_EVENT_INSERT ||
-               lex->trg_chistics.event == TRG_EVENT_UPDATE));
-
-  trg_fld= new (thd->mem_root)
-            Item_trigger_field(thd, lex->current_context(),
-                               Item_trigger_field::NEW_ROW,
-                               name->str, UPDATE_ACL, FALSE);
-
-  if (trg_fld == NULL)
-    return TRUE;
-
-  sp_fld= new (thd->mem_root)
-        sp_instr_set_trigger_field(lex->sphead->instructions(),
-                                                 lex->spcont, trg_fld, val,
-         lex);
-
-  if (sp_fld == NULL)
-    return TRUE;
-
-  /*
-    Let us add this item to list of all Item_trigger_field
-    objects in trigger.
-  */
-  lex->trg_table_fields.link_in_list(trg_fld, &trg_fld->next_trg_field);
-
-  return lex->sphead->add_instr(sp_fld);
-}
-
-
-/**
   Create an object to represent a SP variable in the Item-hierarchy.
 
   @param  thd         The current thread.
@@ -14740,7 +14688,7 @@ option_value_no_option_type:
             if ($1.var == trg_new_row_fake_var)
             {
               /* We are in trigger and assigning value to field of new row */
-              if (set_trigger_new_row(thd, &$1.base_name, $3))
+              if (lex->set_trigger_new_row(&$1.base_name, $3))
                 MYSQL_YYABORT;
             }
             else if ($1.var)
