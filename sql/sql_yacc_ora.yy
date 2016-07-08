@@ -271,59 +271,6 @@ find_sys_var_null_base(THD *thd, struct sys_var_with_base *tmp)
 
 
 /**
-  Create an object to represent a SP variable in the Item-hierarchy.
-
-  @param  thd         The current thread.
-  @param  name        The SP variable name.
-  @param  spvar       The SP variable (optional).
-  @param  start_in_q  Start position of the SP variable name in the query.
-  @param  end_in_q    End position of the SP variable name in the query.
-
-  @remark If spvar is not specified, the name is used to search for the
-          variable in the parse-time context. If the variable does not
-          exist, a error is set and NULL is returned to the caller.
-
-  @return An Item_splocal object representing the SP variable, or NULL on error.
-*/
-static Item_splocal*
-create_item_for_sp_var(THD *thd, LEX_STRING name, sp_variable *spvar,
-                       const char *start_in_q, const char *end_in_q)
-{
-  Item_splocal *item;
-  LEX *lex= thd->lex;
-  uint pos_in_q, len_in_q;
-  sp_pcontext *spc = lex->spcont;
-
-  /* If necessary, look for the variable. */
-  if (spc && !spvar)
-    spvar= spc->find_variable(name, false);
-
-  if (!spvar)
-  {
-    my_error(ER_SP_UNDECLARED_VAR, MYF(0), name.str);
-    return NULL;
-  }
-
-  DBUG_ASSERT(spc && spvar);
-
-  /* Position and length of the SP variable name in the query. */
-  pos_in_q= start_in_q - lex->sphead->m_tmp_query;
-  len_in_q= end_in_q - start_in_q;
-
-  item= new (thd->mem_root)
-    Item_splocal(thd, name, spvar->offset, spvar->sql_type(),
-                 pos_in_q, len_in_q);
-
-#ifndef DBUG_OFF
-  if (item)
-    item->m_sp= lex->sphead;
-#endif
-
-  return item;
-}
-
-
-/**
   Create a separate LEX for each assignment if in SP.
 
   If we are in SP we want have own LEX for each assignment.
@@ -3073,9 +3020,9 @@ simple_target_specification:
           ident
           {
             Lex_input_stream *lip= &thd->m_parser_state->m_lip;
-            $$= create_item_for_sp_var(thd, $1, NULL,
-                                       lip->get_tok_start(), lip->get_ptr());
-
+            $$= thd->lex->create_item_for_sp_var($1, NULL,
+                                                 lip->get_tok_start(),
+                                                 lip->get_ptr());
             if ($$ == NULL)
               MYSQL_YYABORT;
           }

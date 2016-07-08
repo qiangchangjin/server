@@ -3027,6 +3027,9 @@ public:
   bool set_system_variable(struct sys_var_with_base *tmp,
                            enum enum_var_type var_type, Item *val);
   bool set_local_variable(sp_variable *spv, Item *val);
+  Item_splocal *create_item_for_sp_var(LEX_STRING name, sp_variable *spvar,
+                                       const char *start_in_q,
+                                       const char *end_in_q);
 
   // Check if "KEY IF NOT EXISTS name" used outside of ALTER context
   bool check_add_key(DDL_options_st ddl)
