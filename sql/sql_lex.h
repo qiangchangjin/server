@@ -41,6 +41,7 @@ class sp_head;
 class sp_name;
 class sp_instr;
 class sp_pcontext;
+class sp_variable;
 class st_alter_tablespace;
 class partition_info;
 class Event_parse_data;
@@ -3023,6 +3024,9 @@ public:
   bool add_select_to_union_list(bool is_union_distinct,  bool is_top_level);
   bool setup_select_in_parentheses();
   bool set_trigger_new_row(LEX_STRING *name, Item *val);
+  bool set_system_variable(struct sys_var_with_base *tmp,
+                           enum enum_var_type var_type, Item *val);
+  bool set_local_variable(sp_variable *spv, Item *val);
 
   // Check if "KEY IF NOT EXISTS name" used outside of ALTER context
   bool check_add_key(DDL_options_st ddl)

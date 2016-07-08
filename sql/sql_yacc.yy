@@ -399,7 +399,6 @@ find_sys_var_null_base(THD *thd, struct sys_var_with_base *tmp)
   Helper action for a SET statement.
   Used to push a system variable into the assignment list.
 
-  @param thd      the current thread
   @param tmp      the system variable with base name
   @param var_type the scope of the variable
   @param val      the value being assigned to the variable
@@ -407,16 +406,15 @@ find_sys_var_null_base(THD *thd, struct sys_var_with_base *tmp)
   @return TRUE if error, FALSE otherwise.
 */
 
-static bool
-set_system_variable(THD *thd, struct sys_var_with_base *tmp,
-                    enum enum_var_type var_type, Item *val)
+bool
+LEX::set_system_variable(struct sys_var_with_base *tmp,
+                         enum enum_var_type var_type, Item *val)
 {
   set_var *var;
-  LEX *lex= thd->lex;
 
   /* No AUTOCOMMIT from a stored function or trigger. */
-  if (lex->spcont && tmp->var == Sys_autocommit_ptr)
-    lex->sphead->m_flags|= sp_head::HAS_SET_AUTOCOMMIT_STMT;
+  if (spcont && tmp->var == Sys_autocommit_ptr)
+    sphead->m_flags|= sp_head::HAS_SET_AUTOCOMMIT_STMT;
 
   if (val && val->type() == Item::FIELD_ITEM &&
       ((Item_field*)val)->table_name)
@@ -429,7 +427,7 @@ set_system_variable(THD *thd, struct sys_var_with_base *tmp,
          set_var(thd, var_type, tmp->var, &tmp->base_name, val)))
     return TRUE;
 
-  return lex->var_list.push_back(var, thd->mem_root);
+  return var_list.push_back(var, thd->mem_root);
 }
 
 
@@ -437,18 +435,16 @@ set_system_variable(THD *thd, struct sys_var_with_base *tmp,
   Helper action for a SET statement.
   Used to push a SP local variable into the assignment list.
 
-  @param thd      the current thread
   @param var_type the SP local variable
   @param val      the value being assigned to the variable
 
   @return TRUE if error, FALSE otherwise.
 */
 
-static bool
-set_local_variable(THD *thd, sp_variable *spv, Item *val)
+bool
+LEX::set_local_variable(sp_variable *spv, Item *val)
 {
   Item *it;
-  LEX *lex= thd->lex;
   sp_instr_set *sp_set;
 
   if (val)
@@ -463,11 +459,11 @@ set_local_variable(THD *thd, sp_variable *spv, Item *val)
   }
 
   sp_set= new (thd->mem_root)
-         sp_instr_set(lex->sphead->instructions(), lex->spcont,
-                                   spv->offset, it, spv->sql_type(),
-                                   lex, TRUE);
+         sp_instr_set(sphead->instructions(), spcont,
+                      spv->offset, it, spv->sql_type(),
+                      this, true);
 
-  return (sp_set == NULL || lex->sphead->add_instr(sp_set));
+  return (sp_set == NULL || sphead->add_instr(sp_set));
 }
 
 
@@ -15058,7 +15054,7 @@ option_value_following_option_type:
             if ($1.var && $1.var != trg_new_row_fake_var)
             {
               /* It is a system variable. */
-              if (set_system_variable(thd, &$1, lex->option_type, $3))
+              if (lex->set_system_variable(&$1, lex->option_type, $3))
                 MYSQL_YYABORT;
             }
             else
@@ -15088,7 +15084,7 @@ option_value_no_option_type:
             else if ($1.var)
             {
               /* It is a system variable. */
-              if (set_system_variable(thd, &$1, lex->option_type, $3))
+              if (lex->set_system_variable(&$1, lex->option_type, $3))
                 MYSQL_YYABORT;
             }
             else
@@ -15097,7 +15093,7 @@ option_value_no_option_type:
               sp_variable *spv= spc->find_variable($1.base_name, false);
 
               /* It is a local variable. */
-              if (set_local_variable(thd, spv, $3))
+              if (lex->set_local_variable(spv, $3))
                 MYSQL_YYABORT;
             }
           }
@@ -15121,7 +15117,7 @@ option_value_no_option_type:
               if (find_sys_var_null_base(thd, &tmp))
                 MYSQL_YYABORT;
             }
-            if (set_system_variable(thd, &tmp, $3, $6))
+            if (Lex->set_system_variable(&tmp, $3, $6))
               MYSQL_YYABORT;
           }
         | charset old_or_new_charset_name_or_default
