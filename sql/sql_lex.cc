@@ -5180,7 +5180,7 @@ bool LEX::sp_leave_statement(THD *thd, const LEX_STRING label_name)
     my_error(ER_SP_LILABEL_MISMATCH, MYF(0), "LEAVE", label_name.str);
     return true;
   }
-  return sp_exit_block(thd, lab);
+  return sp_exit_block(thd, lab, NULL);
 }
 
 
@@ -5200,7 +5200,29 @@ bool LEX::sp_exit_block(THD *thd, sp_label *lab)
 }
 
 
-bool LEX::sp_exit_statement(THD *thd)
+bool LEX::sp_exit_block(THD *thd, sp_label *lab, Item *when)
+{
+  if (!when)
+    return sp_exit_block(thd, lab);
+
+  sphead->reset_lex(thd); // This changes thd->lex
+  DBUG_ASSERT(sphead == thd->lex->sphead);
+  DBUG_ASSERT(spcont == thd->lex->spcont);
+  sp_instr_jump_if_not *i= new (thd->mem_root)
+                           sp_instr_jump_if_not(sphead->instructions(),
+                                                spcont,
+                                                when, thd->lex);
+  if (i == NULL ||
+      sphead->add_instr(i) ||
+      sphead->restore_lex(thd) ||
+      sp_exit_block(thd, lab))
+    return true;
+  i->backpatch(sphead->instructions(), spcont);
+  return false;
+}
+
+
+bool LEX::sp_exit_statement(THD *thd, Item *item)
 {
   sp_label *lab= spcont->find_label_current_loop_start();
   if (!lab)
@@ -5209,11 +5231,11 @@ bool LEX::sp_exit_statement(THD *thd)
     return true;
   }
   DBUG_ASSERT(lab->type == sp_label::ITERATION);
-  return sp_exit_block(thd, lab);
+  return sp_exit_block(thd, lab, item);
 }
 
 
-bool LEX::sp_exit_statement(THD *thd, const LEX_STRING label_name)
+bool LEX::sp_exit_statement(THD *thd, const LEX_STRING label_name, Item *item)
 {
   sp_label *lab= spcont->find_label(label_name);
   if (!lab || lab->type != sp_label::ITERATION)
@@ -5221,7 +5243,7 @@ bool LEX::sp_exit_statement(THD *thd, const LEX_STRING label_name)
     my_error(ER_SP_LILABEL_MISMATCH, MYF(0), "EXIT", label_name);
     return true;
   }
-  return sp_exit_block(thd, lab);
+  return sp_exit_block(thd, lab, item);
 }
 
 
