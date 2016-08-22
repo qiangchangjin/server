@@ -4785,7 +4785,7 @@ sp_variable *LEX::sp_param_init(LEX_STRING name)
 
 bool LEX::sp_param_fill_definition(sp_variable *spvar)
 {
-  if (sphead->fill_field_definition(thd, this, last_field))
+  if (sphead->fill_field_definition(thd, last_field))
     return true;
   spvar->field_def.field_name= spvar->name.str;
   spvar->field_def.pack_flag |= FIELDFLAG_MAYBE_NULL;
@@ -4927,7 +4927,7 @@ bool LEX::sp_variable_declarations_finalize(THD *thd, int nvars,
     spvar->default_value= dflt_value_item;
     spvar->field_def.field_name= spvar->name.str;
 
-    if (sphead->fill_field_definition(thd, this, &spvar->field_def))
+    if (sphead->fill_field_definition(thd, &spvar->field_def))
       return true;
 
     spvar->field_def.pack_flag |= FIELDFLAG_MAYBE_NULL;

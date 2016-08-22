@@ -16283,7 +16283,7 @@ sf_tail:
           }
           type_with_opt_collate /* $8 */
           { /* $9 */
-            if (Lex->sphead->fill_field_definition(thd, Lex, Lex->last_field))
+            if (Lex->sphead->fill_field_definition(thd, Lex->last_field))
               MYSQL_YYABORT;
           }
           sp_c_chistics /* $10 */

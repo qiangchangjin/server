@@ -2302,8 +2302,7 @@ sp_head::backpatch(sp_label *lab)
 */
 
 bool
-sp_head::fill_field_definition(THD *thd, LEX *lex,
-                               Column_definition *field_def)
+sp_head::fill_field_definition(THD *thd, Column_definition *field_def)
 {
   uint unused1= 0;
 

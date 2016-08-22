@@ -436,8 +436,7 @@ public:
   Field *create_result_field(uint field_max_length, const char *field_name,
                              TABLE *table);
 
-  bool fill_field_definition(THD *thd, LEX *lex,
-                             Column_definition *field_def);
+  bool fill_field_definition(THD *thd, Column_definition *field_def);
 
   void set_info(longlong created, longlong modified,
 		st_sp_chistics *chistics, sql_mode_t sql_mode);
