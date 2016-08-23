@@ -9804,6 +9804,26 @@ err:
 }
 
 
+void Column_definition::set_attributes(const Lex_field_type_st &type,
+                                       CHARSET_INFO *cs)
+{
+  sql_type= type.field_type();
+  charset= cs;
+
+  if (type.length())
+  {
+    int err;
+    length= my_strtoll10(type.length(), NULL, &err);
+    if (err)
+      length= ~0ULL; // safety
+  }
+  else
+    length= 0;
+
+  decimals= type.dec() ? (uint) atoi(type.dec()) : 0;
+}
+
+
 /**
   Convert create_field::length from number of characters to number of bytes.
 */
