@@ -171,6 +171,7 @@ my @DEFAULT_SUITES= qw(
     archive-
     binlog-
     csv-
+    compat/oracle-
     encryption-
     federated-
     funcs_1-

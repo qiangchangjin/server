@@ -144,11 +144,6 @@ static void my_parse_error(THD *thd, uint err_number, const char *yytext=0)
   return my_parse_error_intern(thd, ER_THD(thd, err_number), yytext);
 }
 
-void LEX::parse_error()
-{
-  my_parse_error(thd, ER_SYNTAX_ERROR);
-}
-
 
 /**
   @brief Bison callback to report a syntax/OOM error
@@ -170,7 +165,7 @@ void LEX::parse_error()
   to abort from the parser.
 */
 
-void MYSQLerror(THD *thd, const char *s)
+void ORAerror(THD *thd, const char *s)
 {
   /*
     Restore the original LEX if it was replaced when parsing
@@ -186,27 +181,6 @@ void MYSQLerror(THD *thd, const char *s)
 }
 
 
-#ifndef DBUG_OFF
-void turn_parser_debug_on()
-{
-  /*
-     MYSQLdebug is in sql/sql_yacc.cc, in bison generated code.
-     Turning this option on is **VERY** verbose, and should be
-     used when investigating a syntax error problem only.
-
-     The syntax to run with bison traces is as follows :
-     - Starting a server manually :
-       mysqld --debug-dbug="d,parser_debug" ...
-     - Running a test :
-       mysql-test-run.pl --mysqld="--debug-dbug=d,parser_debug" ...
-
-     The result will be in the process stderr (var/log/master.err)
-   */
-
-  extern int yydebug;
-  yydebug= 1;
-}
-#endif
 
 static bool is_native_function(THD *thd, const LEX_STRING *name)
 {
@@ -283,105 +257,6 @@ static bool push_sp_empty_label(THD *thd)
   return 0;
 }
 
-/**
-  Helper action for a case expression statement (the expr in 'CASE expr').
-  This helper is used for 'searched' cases only.
-  @param lex the parser lex context
-  @param expr the parsed expression
-  @return 0 on success
-*/
-
-int LEX::case_stmt_action_expr(Item* expr)
-{
-  int case_expr_id= spcont->register_case_expr();
-  sp_instr_set_case_expr *i;
-
-  if (spcont->push_case_expr_id(case_expr_id))
-    return 1;
-
-  i= new (thd->mem_root)
-    sp_instr_set_case_expr(sphead->instructions(), spcont, case_expr_id, expr,
-                           this);
-
-  sphead->add_cont_backpatch(i);
-  return sphead->add_instr(i);
-}
-
-/**
-  Helper action for a case when condition.
-  This helper is used for both 'simple' and 'searched' cases.
-  @param lex the parser lex context
-  @param when the parsed expression for the WHEN clause
-  @param simple true for simple cases, false for searched cases
-*/
-
-int LEX::case_stmt_action_when(Item *when, bool simple)
-{
-  uint ip= sphead->instructions();
-  sp_instr_jump_if_not *i;
-  Item_case_expr *var;
-  Item *expr;
-
-  if (simple)
-  {
-    var= new (thd->mem_root)
-         Item_case_expr(thd, spcont->get_current_case_expr_id());
-
-#ifndef DBUG_OFF
-    if (var)
-    {
-      var->m_sp= sphead;
-    }
-#endif
-
-    expr= new (thd->mem_root) Item_func_eq(thd, var, when);
-    i= new (thd->mem_root) sp_instr_jump_if_not(ip, spcont, expr, this);
-  }
-  else
-    i= new (thd->mem_root) sp_instr_jump_if_not(ip, spcont, when, this);
-
-  /*
-    BACKPATCH: Registering forward jump from
-    "case_stmt_action_when" to "case_stmt_action_then"
-    (jump_if_not from instruction 2 to 5, 5 to 8 ... in the example)
-  */
-
-  return
-    !MY_TEST(i) ||
-    sphead->push_backpatch(thd, i, spcont->push_label(thd, empty_lex_str, 0)) ||
-    sphead->add_cont_backpatch(i) ||
-    sphead->add_instr(i);
-}
-
-/**
-  Helper action for a case then statements.
-  This helper is used for both 'simple' and 'searched' cases.
-  @param lex the parser lex context
-*/
-
-int LEX::case_stmt_action_then()
-{
-  uint ip= sphead->instructions();
-  sp_instr_jump *i= new (thd->mem_root) sp_instr_jump(ip, spcont);
-  if (!MY_TEST(i) || sphead->add_instr(i))
-    return 1;
-
-  /*
-    BACKPATCH: Resolving forward jump from
-    "case_stmt_action_when" to "case_stmt_action_then"
-    (jump_if_not from instruction 2 to 5, 5 to 8 ... in the example)
-  */
-
-  sphead->backpatch(spcont->pop_label());
-
-  /*
-    BACKPATCH: Registering forward jump from
-    "case_stmt_action_then" to after END CASE
-    (jump from instruction 4 to 12, 7 to 12 ... in the example)
-  */
-
-  return sphead->push_backpatch(thd, i, spcont->last_label());
-}
 
 static bool
 find_sys_var_null_base(THD *thd, struct sys_var_with_base *tmp)
@@ -575,140 +450,6 @@ create_item_for_sp_var(THD *thd, LEX_STRING name, sp_variable *spvar,
   return item;
 }
 
-/**
-  Helper to resolve the SQL:2003 Syntax exception 1) in <in predicate>.
-  See SQL:2003, Part 2, section 8.4 <in predicate>, Note 184, page 383.
-  This function returns the proper item for the SQL expression
-  <code>left [NOT] IN ( expr )</code>
-  @param thd the current thread
-  @param left the in predicand
-  @param equal true for IN predicates, false for NOT IN predicates
-  @param expr first and only expression of the in value list
-  @return an expression representing the IN predicate.
-*/
-Item* handle_sql2003_note184_exception(THD *thd, Item* left, bool equal,
-                                       Item *expr)
-{
-  /*
-    Relevant references for this issue:
-    - SQL:2003, Part 2, section 8.4 <in predicate>, page 383,
-    - SQL:2003, Part 2, section 7.2 <row value expression>, page 296,
-    - SQL:2003, Part 2, section 6.3 <value expression primary>, page 174,
-    - SQL:2003, Part 2, section 7.15 <subquery>, page 370,
-    - SQL:2003 Feature F561, "Full value expressions".
-
-    The exception in SQL:2003 Note 184 means:
-    Item_singlerow_subselect, which corresponds to a <scalar subquery>,
-    should be re-interpreted as an Item_in_subselect, which corresponds
-    to a <table subquery> when used inside an <in predicate>.
-
-    Our reading of Note 184 is reccursive, so that all:
-    - IN (( <subquery> ))
-    - IN ((( <subquery> )))
-    - IN '('^N <subquery> ')'^N
-    - etc
-    should be interpreted as a <table subquery>, no matter how deep in the
-    expression the <subquery> is.
-  */
-
-  Item *result;
-
-  DBUG_ENTER("handle_sql2003_note184_exception");
-
-  if (expr->type() == Item::SUBSELECT_ITEM)
-  {
-    Item_subselect *expr2 = (Item_subselect*) expr;
-
-    if (expr2->substype() == Item_subselect::SINGLEROW_SUBS)
-    {
-      Item_singlerow_subselect *expr3 = (Item_singlerow_subselect*) expr2;
-      st_select_lex *subselect;
-
-      /*
-        Implement the mandated change, by altering the semantic tree:
-          left IN Item_singlerow_subselect(subselect)
-        is modified to
-          left IN (subselect)
-        which is represented as
-          Item_in_subselect(left, subselect)
-      */
-      subselect= expr3->invalidate_and_restore_select_lex();
-      result= new (thd->mem_root) Item_in_subselect(thd, left, subselect);
-
-      if (! equal)
-        result = negate_expression(thd, result);
-
-      DBUG_RETURN(result);
-    }
-  }
-
-  if (equal)
-    result= new (thd->mem_root) Item_func_eq(thd, left, expr);
-  else
-    result= new (thd->mem_root) Item_func_ne(thd, left, expr);
-
-  DBUG_RETURN(result);
-}
-
-/**
-   @brief Creates a new SELECT_LEX for a UNION branch.
-
-   Sets up and initializes a SELECT_LEX structure for a query once the parser
-   discovers a UNION token. The current SELECT_LEX is pushed on the stack and
-   the new SELECT_LEX becomes the current one.
-
-   @param lex The parser state.
-
-   @param is_union_distinct True if the union preceding the new select
-          statement uses UNION DISTINCT.
-
-   @param is_top_level This should be @c TRUE if the newly created SELECT_LEX
-                       is a non-nested statement.
-
-   @return <code>false</code> if successful, <code>true</code> if an error was
-   reported. In the latter case parsing should stop.
- */
-bool LEX::add_select_to_union_list(bool is_union_distinct,
-                                   bool is_top_level)
-{
-  /* 
-     Only the last SELECT can have INTO. Since the grammar won't allow INTO in
-     a nested SELECT, we make this check only when creating a top-level SELECT.
-  */
-  if (is_top_level && result)
-  {
-    my_error(ER_WRONG_USAGE, MYF(0), "UNION", "INTO");
-    return TRUE;
-  }
-  if (current_select->order_list.first && !current_select->braces)
-  {
-    my_error(ER_WRONG_USAGE, MYF(0), "UNION", "ORDER BY");
-    return TRUE;
-  }
-
-  if (current_select->explicit_limit && !current_select->braces)
-  {
-    my_error(ER_WRONG_USAGE, MYF(0), "UNION", "LIMIT");
-    return TRUE;
-  }
-  if (current_select->linkage == GLOBAL_OPTIONS_TYPE)
-  {
-    my_parse_error(thd, ER_SYNTAX_ERROR);
-    return TRUE;
-  }
-  /* This counter shouldn't be incremented for UNION parts */
-  nest_level--;
-  if (mysql_new_select(this, 0))
-    return TRUE;
-  mysql_init_select(this);
-  current_select->linkage=UNION_TYPE;
-  if (is_union_distinct) /* UNION DISTINCT - remember position */
-    current_select->master_unit()->union_distinct=
-      current_select;
-  return FALSE;
-}
-
-
 static bool add_create_index_prepare(LEX *lex, Table_ident *table)
 {
   lex->sql_command= SQLCOM_CREATE_INDEX;
@@ -849,87 +590,12 @@ static void add_key_to_list(LEX *lex, LEX_STRING *field_name,
   lex->alter_info.key_list.push_back(key, mem_root);
 }
 
-void LEX::init_last_field(Column_definition *field, const char *field_name,
-         CHARSET_INFO *cs)
-{
-  last_field= field;
-
-  field->field_name= field_name;
-
-  /* reset LEX fields that are used in Create_field::set_and_check() */
-  charset= cs;
-}
-
-void LEX::set_last_field_type(const Lex_field_type_st &type)
-{
-  last_field->sql_type= type.field_type();
-  last_field->charset= charset;
-
-  if (type.length())
-  {
-    int err;
-    last_field->length= my_strtoll10(type.length(), NULL, &err);
-    if (err)
-      last_field->length= ~0ULL; // safety
-  }
-  else
-    last_field->length= 0;
-
-  last_field->decimals= type.dec() ? (uint)atoi(type.dec()) : 0;
-}
-
-bool LEX::set_bincmp(CHARSET_INFO *cs, bool bin)
-{
-  /*
-     if charset is NULL - we're parsing a field declaration.
-     we cannot call find_bin_collation for a field here, because actual
-     field charset is determined in get_sql_field_charset() much later.
-     so we only set a flag.
-  */
-  if (!charset)
-  {
-    charset= cs;
-    last_field->flags|= bin ? BINCMP_FLAG : 0;
-    return false;
-  }
-
-  charset= bin ? find_bin_collation(cs ? cs : charset)
-               :                    cs ? cs : charset;
-  return charset == NULL;
-}
-
 #define bincmp_collation(X,Y)           \
   do                                    \
   {                                     \
      if (Lex->set_bincmp(X,Y))          \
        MYSQL_YYABORT;                   \
   } while(0)
-
-Virtual_column_info *add_virtual_expression(THD *thd, const char *txt,
-                                           size_t size, Item *expr)
-{
-  CHARSET_INFO *cs= thd->charset();
-  Virtual_column_info *v= new (thd->mem_root) Virtual_column_info();
-  if (!v)
-  {
-     mem_alloc_error(sizeof(Virtual_column_info));
-     return 0;
-   }
-   /*
-     We have to remove white space as remember_cur_pos may have pointed to end
-     of previous expression.
-   */
-   while (cs->state_map[*(uchar*)txt] == MY_LEX_SKIP)
-   {
-     txt++;
-     size--;
-   }
-   v->expr_str.str= (char* ) thd->strmake(txt, size);
-   v->expr_str.length= size;
-   v->expr_item= expr;
-   v->utf8= 0;  /* connection charset */
-   return v;
-}
 
 %}
 %union {
@@ -1026,7 +692,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %}
 
 %pure-parser                                    /* We have threads */
-%name-prefix "MYSQL"
+%name-prefix "ORA"
 %parse-param { THD *thd }
 %lex-param { THD *thd }
 /*
@@ -6434,6 +6100,8 @@ field_type:
         | LONGTEXT opt_binary
           { $$.set(MYSQL_TYPE_LONG_BLOB); }
         | DECIMAL_SYM float_options field_options
+          { $$.set(MYSQL_TYPE_NEWDECIMAL, $2);}
+        | NUMBER_SYM float_options field_options
           { $$.set(MYSQL_TYPE_NEWDECIMAL, $2);}
         | NUMERIC_SYM float_options field_options
           { $$.set(MYSQL_TYPE_NEWDECIMAL, $2);}
