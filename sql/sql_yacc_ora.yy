@@ -787,6 +787,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  ROLLBACK_SYM                  /* SQL-2003-R */
 %token  ROLLUP_SYM                    /* SQL-2003-R */
 %token  ROUTINE_SYM                   /* SQL-2003-N */
+%token  ROWCOUNT_SYM                  /* Oracle-N   */
 %token  ROWS_SYM                      /* SQL-2003-R */
 %token  ROW_FORMAT_SYM
 %token  ROW_SYM                       /* SQL-2003-R */
@@ -9053,6 +9054,14 @@ function_call_keyword:
             if ($$ == NULL)
               MYSQL_YYABORT;
           }
+        | SQL_SYM '%' ROWCOUNT_SYM
+          {
+            $$= new (thd->mem_root) Item_func_oracle_sql_rowcount(thd);
+            if ($$ == NULL)
+              MYSQL_YYABORT;
+            Lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_SYSTEM_FUNCTION);
+            Lex->safe_to_cache_query= 0;
+          }
         | TIME_SYM '(' expr ')'
           {
             $$= new (thd->mem_root) Item_time_typecast(thd, $3,
@@ -14400,6 +14409,7 @@ keyword_sp:
         | ROLE_SYM                 {}
         | ROLLUP_SYM               {}
         | ROUTINE_SYM              {}
+        | ROWCOUNT_SYM             {}
         | ROWS_SYM                 {}
         | ROW_COUNT_SYM            {}
         | ROW_FORMAT_SYM           {}

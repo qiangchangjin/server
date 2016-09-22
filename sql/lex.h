@@ -521,6 +521,7 @@ static SYMBOL symbols[] = {
   { "ROUTINE",		SYM(ROUTINE_SYM)},
   { "ROW",		SYM(ROW_SYM)},
   { "ROW_COUNT",        SYM(ROW_COUNT_SYM)},
+  { "ROWCOUNT",         SYM(ROWCOUNT_SYM)}, /* Oracle-N */
   { "ROWS",		SYM(ROWS_SYM)},
   { "ROW_FORMAT",	SYM(ROW_FORMAT_SYM)},
   { "RTREE",		SYM(RTREE_SYM)},
