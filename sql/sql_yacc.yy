@@ -1173,6 +1173,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  IPC_SYM
 %token  IS                            /* SQL-2003-R */
 %token  ISOLATION                     /* SQL-2003-R */
+%token  ISOPEN_SYM                    /* Oracle-N   */
 %token  ISSUER_SYM
 %token  ITERATE_SYM
 %token  JOIN_SYM                      /* SQL-2003-R */
@@ -1281,6 +1282,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  NONE_SYM                      /* SQL-2003-R */
 %token  NOT2_SYM
 %token  NOT_SYM                       /* SQL-2003-R */
+%token  NOTFOUND_SYM                  /* Oracle-R   */
 %token  NOW_SYM
 %token  NO_SYM                        /* SQL-2003-R */
 %token  NO_WAIT_SYM
@@ -14313,6 +14315,7 @@ keyword_sp:
         | IO_SYM                   {}
         | IPC_SYM                  {}
         | ISOLATION                {}
+        | ISOPEN_SYM               {}
         | ISSUER_SYM               {}
         | INSERT_METHOD            {}
         | KEY_BLOCK_SIZE           {}
@@ -14381,6 +14384,7 @@ keyword_sp:
         | NO_WAIT_SYM              {}
         | NODEGROUP_SYM            {}
         | NONE_SYM                 {}
+        | NOTFOUND_SYM             {}
         | NUMBER_SYM               {}
         | NVARCHAR_SYM             {}
         | OFFSET_SYM               {}
