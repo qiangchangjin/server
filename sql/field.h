@@ -3267,25 +3267,24 @@ public:
   uint32 get_length(const uchar *ptr, uint packlength);
   uint32 get_length(const uchar *ptr_arg)
   { return get_length(ptr_arg, this->packlength); }
-  inline void get_ptr(uchar **str)
-    {
-      memcpy(str, ptr+packlength, sizeof(uchar*));
-    }
-  inline void get_ptr(uchar **str, uint row_offset)
-    {
-      memcpy(str, ptr+packlength+row_offset, sizeof(char*));
-    }
+  inline uchar *get_ptr() { return get_ptr(0); }
+  inline uchar *get_ptr(my_ptrdiff_t row_offset)
+  {
+    uchar *s;
+    memcpy(&s, ptr + packlength + row_offset, sizeof(uchar*));
+    return s;
+  }
   inline void set_ptr(uchar *length, uchar *data)
-    {
-      memcpy(ptr,length,packlength);
-      memcpy(ptr+packlength, &data,sizeof(char*));
-    }
+  {
+    memcpy(ptr,length,packlength);
+    memcpy(ptr+packlength, &data,sizeof(char*));
+  }
   void set_ptr_offset(my_ptrdiff_t ptr_diff, uint32 length, uchar *data)
-    {
-      uchar *ptr_ofs= ADD_TO_PTR(ptr,ptr_diff,uchar*);
-      store_length(ptr_ofs, packlength, length);
-      memcpy(ptr_ofs+packlength, &data, sizeof(char*));
-    }
+  {
+    uchar *ptr_ofs= ADD_TO_PTR(ptr,ptr_diff,uchar*);
+    store_length(ptr_ofs, packlength, length);
+    memcpy(ptr_ofs+packlength, &data, sizeof(char*));
+  }
   inline void set_ptr(uint32 length, uchar *data)
   {
     set_ptr_offset(0, length, data);
@@ -3299,8 +3298,7 @@ public:
   void sql_type(String &str) const;
   inline bool copy()
   {
-    uchar *tmp;
-    get_ptr(&tmp);
+    uchar *tmp= get_ptr();
     if (value.copy((char*) tmp, get_length(), charset()))
     {
       Field_blob::reset();
