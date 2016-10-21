@@ -7237,3 +7237,6 @@ ER_INVALID_DEFAULT_PARAM
         ukr "Значення за замовчуванням не підтримано для цього випадку використання параьетра"
 ER_BINLOG_NON_SUPPORTED_BULK
         eng "Only row based replication supported for bulk operations"
+ER_WRONG_PARAMCOUNT_TO_CURSOR 42000 
+        eng "Incorrect parameter count to cursor '%-.192s'"
+        rus "Некорректное количество параметров для курсора '%-.192s'"
