@@ -315,7 +315,6 @@ class ha_innobase: public handler
 	void set_partition_owner_stats(ha_statistics *stats);
 	bool check_if_incompatible_data(HA_CREATE_INFO *info,
 					uint table_changes);
-	bool check_if_supported_virtual_columns(void) { return TRUE; }
 
 private:
 	/** Builds a 'template' to the prebuilt struct.
