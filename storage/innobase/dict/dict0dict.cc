@@ -660,41 +660,6 @@ dict_table_get_col_name(
 	return(s);
 }
 
-/**********************************************************************//**
-Returns a column's name.
-@return column name. NOTE: not guaranteed to stay valid if table is
-modified in any way (columns added, etc.). */
-UNIV_INTERN
-const char*
-dict_table_get_col_name_for_mysql(
-/*==============================*/
-	const dict_table_t*	table,	/*!< in: table */
-	const char*		col_name)/*! in: MySQL table column name */
-{
-	ulint		i;
-	const char*	s;
-
-	ut_ad(table);
-	ut_ad(col_name);
-	ut_ad(table->magic_n == DICT_TABLE_MAGIC_N);
-
-	s = table->col_names;
-	if (s) {
-		/* If we have many virtual columns MySQL key_part->fieldnr
-		could be larger than number of columns in InnoDB table
-		when creating new indexes. */
-		for (i = 0; i < table->n_def; i++) {
-
-			if (!innobase_strcasecmp(s, col_name)) {
-				break; /* Found */
-			}
-			s += strlen(s) + 1;
-		}
-	}
-
-	return(s);
-}
-
 /** Returns a virtual column's name.
 @param[in]	table	target table
 @param[in]	col_nr	virtual column number (nth virtual column)
@@ -2700,7 +2665,7 @@ dict_index_add_to_cache_w_vcol(
 		} else if (current_thd != NULL) {
 			/* Avoid the warning to be printed
 			during recovery. */
-			ib_warn_row_too_big((const dict_table_t*)table);
+			ib_warn_row_too_big(table);
 		}
 	}
 

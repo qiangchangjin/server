@@ -119,6 +119,8 @@ public:
 
 	const key_map* keys_to_use_for_scanning();
 
+        void column_bitmaps_signal();
+
 	/** Opens dictionary table object using table name. For partition, we need to
 	try alternative lower/upper case names to support moving data files across
 	platforms.
@@ -1051,13 +1053,9 @@ innodb_base_col_setup_for_stored(
 	dict_s_col_t*		s_col);
 
 /** whether this is a stored column */
-// JAN: TODO: MySQL 5.7 virtual fields
-//#define innobase_is_s_fld(field) ((field)->gcol_info && (field)->stored_in_db)
-#define innobase_is_s_fld(field) (field == NULL)
-// JAN: TODO: MySQL 5.7 virtual fields
+#define innobase_is_s_fld(field) ((field)->vcol_info && (field)->stored_in_db())
 /** whether this is a computed virtual column */
-//#define innobase_is_v_fld(field) ((field)->gcol_info && !(field)->stored_in_db)
-#define innobase_is_v_fld(field) (field == NULL)
+#define innobase_is_v_fld(field) ((field)->vcol_info && !(field)->stored_in_db())
 
 /** Release temporary latches.
 Call this function when mysqld passes control to the client. That is to
@@ -1129,21 +1127,19 @@ innodb_rec_per_key(
 	ha_rows		records);
 
 /** Build template for the virtual columns and their base columns
-@param[in]	table		MySQL TABLE
+@param[in]	share		MySQL TABLE_SHARE
 @param[in]	ib_table	InnoDB dict_table_t
 @param[in,out]	s_templ		InnoDB template structure
 @param[in]	add_v		new virtual columns added along with
 				add index call
-@param[in]	locked		true if innobase_share_mutex is held
-@param[in]	share_tbl_name	original MySQL table name */
+@param[in]	locked		true if innobase_share_mutex is held */
 void
 innobase_build_v_templ(
-	const TABLE*		table,
+	const TABLE_SHARE*	share,
 	const dict_table_t*	ib_table,
 	dict_vcol_templ_t*	s_templ,
 	const dict_add_v_col_t*	add_v,
-	bool			locked,
-	const char*		share_tbl_name);
+	bool			locked);
 
 /** callback used by MySQL server layer to initialized
 the table virtual columns' template

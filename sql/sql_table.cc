@@ -6223,17 +6223,6 @@ static int compare_uint(const uint *s, const uint *t)
 }
 
 
-/*
-  Check if the column is computed and either
-  is stored or is used in the partitioning expression.
-*/
-static bool vcol_affecting_storage(const Virtual_column_info* vcol,
-                                   bool indexed)
-{
-  return vcol &&
-    (vcol->is_stored() || vcol->is_in_partitioning_expr() || indexed);
-}
-
 /**
    Compare original and new versions of a table and fill Alter_inplace_info
    describing differences between those versions.
@@ -6302,11 +6291,6 @@ static bool fill_alter_inplace_info(THD *thd,
                             alter_info->key_list.elements)))
     DBUG_RETURN(true);
 
-  /* First we setup ha_alter_flags based on what was detected by parser. */
-  if (alter_info->flags & Alter_info::ALTER_ADD_COLUMN)
-    ha_flags|= Inpl::ADD_COLUMN;
-  if (alter_info->flags & Alter_info::ALTER_DROP_COLUMN)
-    ha_flags|= Inpl::DROP_COLUMN;
   /*
     Comparing new and old default values of column is cumbersome.
     So instead of using such a comparison for detecting if default
@@ -6354,7 +6338,7 @@ static bool fill_alter_inplace_info(THD *thd,
     upgrading VARCHAR column types.
   */
   if (table->s->frm_version < FRM_VER_TRUE_VARCHAR && varchar)
-    ha_flags|=  Inpl::ALTER_COLUMN_TYPE;
+    ha_flags|=  Inpl::ALTER_STORED_COLUMN_TYPE;
 
   /*
     Go through fields in old version of table and detect changes to them.
@@ -6396,7 +6380,10 @@ static bool fill_alter_inplace_info(THD *thd,
       {
       case IS_EQUAL_NO:
         /* New column type is incompatible with old one. */
-        ha_flags|= Inpl::ALTER_COLUMN_TYPE;
+        if (field->stored_in_db())
+          ha_flags|= Inpl::ALTER_STORED_COLUMN_TYPE;
+        else
+          ha_flags|= Inpl::ALTER_VIRTUAL_COLUMN_TYPE;
         if (table->s->tmp_table == NO_TMP_TABLE)
         {
           delete_statistics_for_column(thd, table, field);
@@ -6440,31 +6427,52 @@ static bool fill_alter_inplace_info(THD *thd,
       default:
         DBUG_ASSERT(0);
         /* Safety. */
-        ha_flags|= Inpl::ALTER_COLUMN_TYPE;
+        ha_flags|= Inpl::ALTER_STORED_COLUMN_TYPE;
       }
 
-      if (vcol_affecting_storage(field->vcol_info,
-                                 field->flags & PART_KEY_FLAG) ||
-          vcol_affecting_storage(new_field->vcol_info, false))
+      if (field->vcol_info || new_field->vcol_info)
       {
-        if (is_equal == IS_EQUAL_NO ||
-            !field->vcol_info || !new_field->vcol_info ||
-            !field->vcol_info->is_equal(new_field->vcol_info))
-          ha_flags|= Inpl::ALTER_COLUMN_VCOL;
-        else
+        /* base <-> virtual or stored <-> virtual */
+        if (field->stored_in_db() != new_field->stored_in_db())
+          ha_flags|= Inpl::ALTER_STORED_COLUMN_TYPE |
+                     Inpl::ALTER_VIRTUAL_COLUMN_TYPE;
+        if (field->vcol_info && new_field->vcol_info)
         {
-          if (!(ha_alter_info->handler_flags & Alter_inplace_info::ALTER_COLUMN_VCOL) &&
-               (ha_alter_info->handler_flags & Alter_inplace_info::ALTER_COLUMN_DEFAULT))
+          bool value_changes= is_equal == IS_EQUAL_NO;
+          Inpl::HA_ALTER_FLAGS ALTER_EXPR= field->stored_in_db()
+                                           ? Inpl::ALTER_STORED_GCOL_EXPR
+                                           : Inpl::ALTER_VIRTUAL_GCOL_EXPR;
+          if (!field->vcol_info->is_equal(new_field->vcol_info))
+          {
+            ha_flags|= ALTER_EXPR;
+            value_changes= true;
+          }
+
+          if ((ha_flags & Inpl::ALTER_COLUMN_DEFAULT) && !(ha_flags & ALTER_EXPR))
           { /*
-              a DEFAULT value of a some column was changed.
-              see if this vcol uses DEFAULT() function
+              a DEFAULT value of a some column was changed.  see if this vcol
+              uses DEFAULT() function. The check is kind of expensive, so don't
+              do it if ALTER_COLUMN_VCOL is already set.
             */
             if (field->vcol_info->expr_item->walk(
                                  &Item::check_func_default_processor, 0, 0))
-              ha_alter_info->handler_flags|= Alter_inplace_info::ALTER_COLUMN_VCOL;
+            {
+              ha_flags|= ALTER_EXPR;
+              value_changes= true;
+            }
+          }
+
+          if (field->vcol_info->is_in_partitioning_expr() ||
+              field->flags & PART_KEY_FLAG)
+          {
+            if (value_changes)
+              ha_flags|= Inpl::ALTER_COLUMN_VCOL;
+            else
+              maybe_alter_vcol= true;
           }
         }
-        maybe_alter_vcol= true;
+        else /* base <-> stored */
+          ha_flags|= Inpl::ALTER_STORED_COLUMN_TYPE;
       }
 
       /* Check if field was renamed */
@@ -6496,7 +6504,12 @@ static bool fill_alter_inplace_info(THD *thd,
         Detect changes in column order.
       */
       if (field->field_index != new_field_index)
-        ha_flags|= Inpl::ALTER_COLUMN_ORDER;
+      {
+        if (field->stored_in_db())
+          ha_flags|= Inpl::ALTER_STORED_COLUMN_ORDER;
+        else
+          ha_flags|= Inpl::ALTER_VIRTUAL_COLUMN_ORDER;
+      }
 
       /* Detect changes in storage type of column */
       if (new_field->field_storage_type() != field->field_storage_type())
@@ -6517,12 +6530,12 @@ static bool fill_alter_inplace_info(THD *thd,
     }
     else
     {
-      /*
-        Field is not present in new version of table and therefore was dropped.
-        Corresponding storage engine flag should be already set.
-      */
-      DBUG_ASSERT(ha_flags & Inpl::DROP_COLUMN);
+      // Field is not present in new version of table and therefore was dropped.
       field->flags|= FIELD_IS_DROPPED;
+      if (field->stored_in_db())
+        ha_flags|= Inpl::DROP_STORED_COLUMN;
+      else
+        ha_flags|= Inpl::DROP_VIRTUAL_COLUMN;
     }
   }
 
@@ -6534,7 +6547,9 @@ static bool fill_alter_inplace_info(THD *thd,
       (FIXME), so let's just say that a vcol *might* be affected if any other
       column was altered.
     */
-    if (ha_flags & ( Inpl::ALTER_COLUMN_TYPE | Inpl::ALTER_COLUMN_NOT_NULLABLE
+    if (ha_flags & ( Inpl::ALTER_STORED_COLUMN_TYPE
+                   | Inpl::ALTER_VIRTUAL_COLUMN_TYPE
+                   | Inpl::ALTER_COLUMN_NOT_NULLABLE
                    | Inpl::ALTER_COLUMN_OPTION ))
       ha_flags|= Inpl::ALTER_COLUMN_VCOL;
   }
@@ -6544,17 +6559,14 @@ static bool fill_alter_inplace_info(THD *thd,
   {
     if (! new_field->field)
     {
-      /*
-        Field is not present in old version of table and therefore was added.
-        Again corresponding storage engine flag should be already set.
-      */
-      DBUG_ASSERT(ha_flags & Inpl::ADD_COLUMN);
-
-      if (new_field->vcol_info && 
-          (new_field->stored_in_db() || new_field->vcol_info->is_in_partitioning_expr()))
-      {
-        ha_flags|= Inpl::ALTER_COLUMN_VCOL;
-      }
+      // Field is not present in old version of table and therefore was added.
+      if (new_field->vcol_info)
+        if (new_field->stored_in_db())
+          ha_flags|= Inpl::ADD_STORED_GENERATED_COLUMN;
+        else
+          ha_flags|= Inpl::ADD_VIRTUAL_COLUMN;
+      else
+        ha_flags|= Inpl::ADD_STORED_BASE_COLUMN;
     }
   }
 

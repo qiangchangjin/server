@@ -3343,6 +3343,7 @@ row_create_index_for_mysql(
 		in dict0crea.cc. */
 
 		heap = mem_heap_create(512);
+
 		node = ind_create_graph_create(index, heap, NULL);
 
 		thr = pars_complete_graph_for_exec(node, trx, heap, NULL);
@@ -4850,6 +4851,7 @@ row_drop_table_for_mysql(
 		dict_table_t.  Free this memory before returning. */
 		if (DICT_TF_HAS_DATA_DIR(table->flags)) {
 			ut_a(table->data_dir_path);
+
 			filepath = fil_make_filepath(
 				table->data_dir_path,
 				table->name.m_name, IBD, true);
@@ -5740,14 +5742,12 @@ end:
 			goto funct_exit;
 		}
 
-#ifdef MYSQL_VIRTUAL_COLUMNS
 		/* In case of copy alter, template db_name and
 		table_name should be renamed only for newly
 		created table. */
 		if (table->vc_templ != NULL && !new_is_tmp) {
 			innobase_rename_vc_templ(table);
 		}
-#endif
 
 		/* We only want to switch off some of the type checking in
 		an ALTER TABLE...ALGORITHM=COPY, not in a RENAME. */

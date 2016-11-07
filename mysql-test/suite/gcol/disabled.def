@@ -1,3 +1,0 @@
-gcol_rollback : innodb vcol indexes
-gcol_update: innodb vcol indexes
-gcol_bugfixes: innodb vcol indexes

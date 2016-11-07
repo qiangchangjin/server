@@ -4561,6 +4561,21 @@ extern "C" int thd_is_connected(MYSQL_THD thd)
 
 
 #ifdef INNODB_COMPATIBILITY_HOOKS
+MYSQL_THD create_thd(int use_next_id)
+{
+  THD *thd= new THD(use_next_id ? next_thread_id() : 0);
+  thd->thread_stack= (char*) &thd;
+  thd->store_globals();
+  thd->set_command(COM_DAEMON);
+  add_to_active_threads(thd);
+  return thd;
+}
+
+void destroy_thd(MYSQL_THD thd)
+{
+  delete_running_thd(thd);
+}
+
 extern "C" const struct charset_info_st *thd_charset(MYSQL_THD thd)
 {
   return(thd->charset());

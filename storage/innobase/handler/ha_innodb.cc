@@ -293,6 +293,39 @@ static inline char *is_partition(char *file_name)
 #endif /* _WIN32 */
 }
 
+MYSQL_THD create_thd(int use_next_id);
+void destroy_thd(MYSQL_THD thd);
+st_my_thread_var *thd_destructor_myvar= _my_thread_var();
+mysql_mutex_t thd_destructor_mutex;
+mysql_cond_t thd_destructor_cond;
+pthread_t thd_destructor_thread;
+pthread_handler_t thd_destructor_proxy(void *)
+{
+        my_thread_init();
+        mysql_mutex_init(PSI_NOT_INSTRUMENTED, &thd_destructor_mutex, 0);
+        mysql_cond_init(PSI_NOT_INSTRUMENTED, &thd_destructor_cond, 0);
+
+        thd_destructor_myvar= _my_thread_var();
+        THD *thd= create_thd(true);
+
+        mysql_mutex_lock(&thd_destructor_mutex);
+        thd_destructor_myvar->current_mutex= &thd_destructor_mutex;
+        thd_destructor_myvar->current_cond= &thd_destructor_cond;
+        while (!thd_destructor_myvar->abort)
+                mysql_cond_wait(&thd_destructor_cond, &thd_destructor_mutex);
+        mysql_mutex_unlock(&thd_destructor_mutex);
+        thd_destructor_myvar= NULL;
+
+	srv_purge_wakeup();
+
+        destroy_thd(thd);
+        mysql_cond_destroy(&thd_destructor_cond);
+        mysql_mutex_destroy(&thd_destructor_mutex);
+        my_thread_end();
+        return 0;
+}
+
+
 /** Return the InnoDB ROW_FORMAT enum value
 @param[in]	row_format	row_format from "innodb_default_row_format"
 @return InnoDB ROW_FORMAT value from rec_format_t enum. */
@@ -449,6 +482,7 @@ static mysql_pfs_key_t	innobase_share_mutex_key;
 static mysql_pfs_key_t	commit_cond_mutex_key;
 static mysql_pfs_key_t	commit_cond_key;
 static mysql_pfs_key_t	pending_checkpoint_mutex_key;
+static mysql_pfs_key_t  thd_destructor_thread_key;
 
 static PSI_mutex_info	all_pthread_mutexes[] = {
 	PSI_KEY(commit_cond_mutex),
@@ -576,6 +610,7 @@ static PSI_thread_info	all_innodb_threads[] = {
 	PSI_KEY(srv_purge_thread),
 	PSI_KEY(srv_worker_thread),
 	PSI_KEY(trx_rollback_clean_thread),
+	PSI_KEY(thd_destructor_thread),
 };
 # endif /* UNIV_PFS_THREAD */
 
@@ -842,13 +877,17 @@ innobase_map_isolation_level(
 
 /** Gets field offset for a field in a table.
 @param[in]	table	MySQL table object
-@param[in]	field	MySQL field object
+@param[in]	field	MySQL field object (from table->field array)
 @return offset */
 static inline
 uint
 get_field_offset(
 	const TABLE*	table,
-	const Field*	field);
+	const Field*	field)
+{
+	return field->offset(table->record[0]);
+}
+
 
 /*************************************************************//**
 Check for a valid value of innobase_compression_algorithm.
@@ -2716,11 +2755,10 @@ innobase_mysql_tmpfile(
 			char errbuf[MYSYS_STRERROR_SIZE];
 			DBUG_PRINT("error",("Got error %d on dup",fd2));
 			set_my_errno(errno);
-			my_strerror(errbuf, sizeof(errbuf), my_errno);
 			my_error(EE_OUT_OF_FILERESOURCES,
 				 MYF(0),
-				 "ib*", my_errno,
-				 errbuf);
+				 "ib*", errno,
+				  my_strerror(errbuf, sizeof(errbuf), errno));
 		}
 		my_close(fd, MYF(MY_WME));
 	}
@@ -3326,7 +3364,6 @@ ha_innobase::ha_innobase(
 	m_user_thd(),
 	m_int_table_flags(HA_REC_NOT_IN_SEQ
 			  | HA_NULL_IN_KEY
-			  | HA_CAN_VIRTUAL_COLUMNS
 			  | HA_CAN_INDEX_BLOBS
 			  | HA_CAN_SQL_HANDLER
 			  | HA_PRIMARY_KEY_REQUIRED_FOR_POSITION
@@ -3344,6 +3381,7 @@ ha_innobase::ha_innobase(
 			  | HA_CAN_RTREEKEYS
 			  | HA_CONCURRENT_OPTIMIZE
 			  |  (srv_force_primary_key ? HA_REQUIRE_PRIMARY_KEY : 0)
+			  | HA_CAN_VIRTUAL_COLUMNS
 		  ),
 	m_start_of_scan(),
 	m_num_write_row(),
@@ -4063,12 +4101,6 @@ innobase_init(
 	innobase_hton->commit_by_xid = innobase_commit_by_xid;
 	innobase_hton->rollback_by_xid = innobase_rollback_by_xid;
 	innobase_hton->commit_checkpoint_request=innobase_checkpoint_request;
-
-#ifdef INNOBASE_CURSOR_VIEW
-	innobase_hton->create_cursor_read_view = innobase_create_cursor_view;
-	innobase_hton->set_cursor_read_view = innobase_set_cursor_view;
-	innobase_hton->close_cursor_read_view = innobase_close_cursor_view;
-#endif
 	innobase_hton->create = innobase_create_handler;
 
 #ifdef MYSQL_TABLESPACES
@@ -4667,6 +4699,12 @@ innobase_change_buffering_inited_ok:
 	}
 	*/
 
+        thd_destructor_myvar= NULL;
+        if (!srv_read_only_mode)
+                mysql_thread_create(thd_destructor_thread_key,
+                                    &thd_destructor_thread,
+                                    NULL, thd_destructor_proxy, NULL);
+
 	/* Since we in this module access directly the fields of a trx
 	struct, and due to different headers and flags it might happen that
 	ib_mutex_t has a different size in this module and in InnoDB
@@ -4740,7 +4778,6 @@ innobase_change_buffering_inited_ok:
 	/* Turn on monitor counters that are default on */
 	srv_mon_default_on();
 
-
 	/* Unit Tests */
 #ifdef UNIV_ENABLE_UNIT_TEST_GET_PARENT_DIR
 	unit_test_os_file_get_parent_dir();
@@ -4801,6 +4838,13 @@ innobase_end(
 #ifdef MYSQL_ENCRYPTION
 		mutex_free(&master_key_id_mutex);
 #endif
+
+                if (!abort_loop)
+                {
+                        thd_destructor_myvar->abort= 1;
+                        mysql_cond_broadcast(&thd_destructor_cond);
+                }
+
 		if (innobase_shutdown_for_mysql() != DB_SUCCESS) {
 			err = 1;
 		}
@@ -5940,6 +5984,33 @@ ha_innobase::keys_to_use_for_scanning()
 }
 
 /****************************************************************//**
+Ensures that if primary key columns are modified, all
+indexed virtual columns are computed - as we're going to update
+all indexes */
+
+void ha_innobase::column_bitmaps_signal()
+/*=====================================*/
+{
+        if (!table->vfield || table->s->primary_key == MAX_KEY)
+	        return;
+
+        KEY *pk= table->key_info + table->s->primary_key;
+        for (uint i=0; i < pk->user_defined_key_parts; i++) {
+                if (bitmap_is_set(table->write_set, pk->key_part[i].fieldnr - 1)) {
+                        goto found;
+                }
+        }
+        return;
+
+found:
+        for (uint j=0; j < table->s->virtual_fields; j++) {
+                if (table->vfield[j]->flags & PART_KEY_FLAG)
+                        table->mark_virtual_col(table->vfield[j]);
+        }
+}
+
+
+/****************************************************************//**
 Determines if table caching is supported.
 @return HA_CACHE_TBL_ASKTRANSACT */
 
@@ -6226,8 +6297,6 @@ innobase_match_index_columns(
 			if (innodb_idx_fld >= innodb_idx_fld_end) {
 				DBUG_RETURN(FALSE);
 			}
-
-			mtype = innodb_idx_fld->col->mtype;
 		}
 
 		/* MariaDB-5.5 compatibility */
@@ -6271,9 +6340,8 @@ innobase_match_index_columns(
 	DBUG_RETURN(TRUE);
 }
 
-#ifdef MYSQL_VIRTUAL_COLUMNS
 /** Build a template for a base column for a virtual column
-@param[in]	table		MySQL TABLE
+@param[in]	share		MySQL TABLE_SHARE
 @param[in]	clust_index	InnoDB clustered index
 @param[in]	field		field in MySQL table
 @param[in]	col		InnoDB column
@@ -6283,7 +6351,7 @@ innobase_match_index_columns(
 static
 void
 innobase_vcol_build_templ(
-	const TABLE*		table,
+	const TABLE_SHARE*	share,
 	dict_index_t*		clust_index,
 	Field*			field,
 	const dict_col_t*	col,
@@ -6307,7 +6375,7 @@ innobase_vcol_build_templ(
 
 	if (field->real_maybe_null()) {
                 templ->mysql_null_byte_offset =
-                        field->null_offset();
+                        field->null_offset(share->default_values);
 
                 templ->mysql_null_bit_mask = (ulint) field->null_bit;
         } else {
@@ -6315,7 +6383,7 @@ innobase_vcol_build_templ(
         }
 
         templ->mysql_col_offset = static_cast<ulint>(
-					get_field_offset(table, field));
+					field->offset(share->default_values));
 	templ->mysql_col_len = static_cast<ulint>(field->pack_length());
         templ->type = col->mtype;
         templ->mysql_type = static_cast<ulint>(field->type());
@@ -6342,27 +6410,24 @@ innobase_build_v_templ_callback(
 {
 	const dict_table_t* t_table = static_cast<dict_table_t*>(ib_table);
 
-	innobase_build_v_templ(table, t_table, t_table->vc_templ, NULL,
-			       true, NULL);
+	innobase_build_v_templ(table->s, t_table, t_table->vc_templ, NULL, true);
 }
 
 /** Build template for the virtual columns and their base columns. This
 is done when the table first opened.
-@param[in]	table		MySQL TABLE
+@param[in]	share		MySQL TABLE_SHARE
 @param[in]	ib_table	InnoDB dict_table_t
 @param[in,out]	s_templ		InnoDB template structure
 @param[in]	add_v		new virtual columns added along with
 				add index call
-@param[in]	locked		true if dict_sys mutex is held
-@param[in]	share_tbl_name	original MySQL table name */
+@param[in]	locked		true if dict_sys mutex is held */
 void
 innobase_build_v_templ(
-	const TABLE*		table,
+	const TABLE_SHARE*	share,
 	const dict_table_t*	ib_table,
 	dict_vcol_templ_t*	s_templ,
 	const dict_add_v_col_t*	add_v,
-	bool			locked,
-	const char*		share_tbl_name)
+	bool			locked)
 {
 	ulint	ncol = ib_table->n_cols - DATA_N_SYS_COLS;
 	ulint	n_v_col = ib_table->n_v_cols;
@@ -6394,15 +6459,14 @@ innobase_build_v_templ(
 				* sizeof *s_templ->vtempl));
 	s_templ->n_col = ncol;
 	s_templ->n_v_col = n_v_col;
-	s_templ->rec_len = table->s->stored_rec_length;
+	s_templ->rec_len = share->reclength;
 	// JAN: MySQL 5.6
-	// s_templ->default_rec = table->s->default_values;
+	// s_templ->default_rec = share->default_values;
 
 	s_templ->default_rec = static_cast<byte*>(
-		ut_malloc_nokey(table->s->stored_rec_length));
-	memcpy(s_templ->default_rec, table->s->default_values,
-	       table->s->stored_rec_length);
-
+		ut_malloc_nokey(share->reclength));
+	memcpy(s_templ->default_rec, share->default_values,
+	       share->reclength);
 
 	/* Mark those columns could be base columns */
 	for (ulint i = 0; i < ib_table->n_v_cols; i++) {
@@ -6431,8 +6495,8 @@ innobase_build_v_templ(
 
 	dict_index_t*	clust_index = dict_table_get_first_index(ib_table);
 
-	for (ulint i = 0; i < table->s->fields; i++) {
-		Field*  field = table->field[i];
+	for (ulint i = 0; i < share->fields; i++) {
+		Field*  field = share->field[i];
 
 		/* Build template for virtual columns */
 		if (innobase_is_v_fld(field)) {
@@ -6461,7 +6525,7 @@ innobase_build_v_templ(
 					sizeof *s_templ->vtempl[j]));
 
 			innobase_vcol_build_templ(
-				table, clust_index, field,
+				share, clust_index, field,
 				&vcol->m_col,
 				s_templ->vtempl[z + s_templ->n_col],
 				z);
@@ -6489,7 +6553,7 @@ innobase_build_v_templ(
 					sizeof *s_templ->vtempl[j]));
 
 			innobase_vcol_build_templ(
-				table, clust_index, field, col,
+				share, clust_index, field, col,
 				s_templ->vtempl[j], j);
 		}
 
@@ -6500,14 +6564,9 @@ innobase_build_v_templ(
 		mutex_exit(&dict_sys->mutex);
 	}
 
-	s_templ->db_name = table->s->db.str;
-	s_templ->tb_name = table->s->table_name.str;
-
-	if (share_tbl_name) {
-		s_templ->share_name = share_tbl_name;
-	}
+	s_templ->db_name = share->db.str;
+	s_templ->tb_name = share->table_name.str;
 }
-#endif /* MYSQL_VIRTUAL_COLUMNS */
 
 /*******************************************************************//**
 This function builds a translation table in INNOBASE_SHARE
@@ -6900,14 +6959,14 @@ ha_innobase::open(
 
 	if (ib_table != NULL
 	    && ((!DICT_TF2_FLAG_IS_SET(ib_table, DICT_TF2_FTS_HAS_DOC_ID)
-		 && table->s->stored_fields != dict_table_get_n_tot_u_cols(ib_table))
+		 && table->s->fields != dict_table_get_n_tot_u_cols(ib_table))
 		|| (DICT_TF2_FLAG_IS_SET(ib_table, DICT_TF2_FTS_HAS_DOC_ID)
-		    && (table->s->stored_fields
+		    && (table->s->fields
 			!= dict_table_get_n_tot_u_cols(ib_table) - 1)))) {
 
 		ib::warn() << "Table " << norm_name << " contains "
 			<< dict_table_get_n_user_cols(ib_table) << " user"
-			" defined columns in InnoDB, but " << table->s->stored_fields
+			" defined columns in InnoDB, but " << table->s->fields
 			<< " columns in MariaDB. Please check"
 			" INFORMATION_SCHEMA.INNODB_SYS_COLUMNS and " REFMAN
 			"innodb-troubleshooting.html for how to resolve the"
@@ -7053,7 +7112,7 @@ ha_innobase::open(
 		DBUG_RETURN(ret_err);
 	}
 
-	m_prebuilt = row_create_prebuilt(ib_table, table->s->stored_rec_length);
+	m_prebuilt = row_create_prebuilt(ib_table, table->s->reclength);
 
 	m_prebuilt->default_rec = table->s->default_values;
 	ut_ad(m_prebuilt->default_rec);
@@ -7065,7 +7124,6 @@ ha_innobase::open(
 
 	key_used_on_scan = m_primary_key;
 
-#ifdef MYSQL_VIRTUAL_COLUMNS
 	if (ib_table->n_v_cols) {
 		mutex_enter(&dict_sys->mutex);
 		if (ib_table->vc_templ == NULL) {
@@ -7080,13 +7138,12 @@ ha_innobase::open(
 
 		if (ib_table->vc_templ->vtempl == NULL) {
 			innobase_build_v_templ(
-				table, ib_table, ib_table->vc_templ, NULL,
-				true, m_share->table_name);
+				table->s, ib_table, ib_table->vc_templ, NULL,
+				true);
 		}
 
 		mutex_exit(&dict_sys->mutex);
 	}
-#endif /* MYSQL_VIRTUAL_COLUMNS */
 
 	if (!innobase_build_index_translation(table, ib_table, m_share)) {
 		  sql_print_error("Build InnoDB index translation table for"
@@ -7433,19 +7490,6 @@ ha_innobase::close()
 }
 
 /* The following accessor functions should really be inside MySQL code! */
-
-/** Gets field offset for a field in a table.
-@param[in]	table	MySQL table object
-@param[in]	field	MySQL field object
-@return offset */
-static inline
-uint
-get_field_offset(
-	const TABLE*	table,
-	const Field*	field)
-{
-	return(static_cast<uint>((field->ptr - table->record[0])));
-}
 
 #ifdef WITH_WSREP
 UNIV_INTERN
@@ -8200,10 +8244,9 @@ build_template_needs_field(
 	dict_index_t*	index,		/*!< in: InnoDB index to use */
 	const TABLE*	table,		/*!< in: MySQL table object */
 	ulint		i,		/*!< in: field index in InnoDB table */
-	ulint		sql_idx,	/*!< in: field index in SQL table */
 	ulint		num_v)		/*!< in: num virtual column so far */
 {
-	const Field*	field	= table->field[sql_idx];
+	const Field*	field	= table->field[i];
 
 	if (!index_contains) {
 		if (read_just_key) {
@@ -8218,8 +8261,8 @@ build_template_needs_field(
 		return(field);
 	}
 
-	if (bitmap_is_set(table->read_set, static_cast<uint>(sql_idx))
-	    || bitmap_is_set(table->write_set, static_cast<uint>(sql_idx))) {
+	if (bitmap_is_set(table->read_set, static_cast<uint>(i))
+	    || bitmap_is_set(table->write_set, static_cast<uint>(i))) {
 		/* This field is needed in the query */
 
 		return(field);
@@ -8401,10 +8444,10 @@ ha_innobase::build_template(
 {
 	dict_index_t*	index;
 	dict_index_t*	clust_index;
-	ulint		n_stored_fields;
+	ulint		n_fields;
 	ibool		fetch_all_in_key	= FALSE;
 	ibool		fetch_primary_key_cols	= FALSE;
-	ulint		i, sql_idx;
+	ulint		i;
 
 	if (m_prebuilt->select_lock_type == LOCK_X) {
 		/* We always retrieve the whole clustered index record if we
@@ -8457,12 +8500,11 @@ ha_innobase::build_template(
 	/* Below we check column by column if we need to access
 	the clustered index. */
 
-	/* number of stored columns */
-	n_stored_fields= (ulint)table->s->stored_fields;
+	n_fields = (ulint) table->s->fields; /* number of columns */
 
 	if (!m_prebuilt->mysql_template) {
 		m_prebuilt->mysql_template = (mysql_row_templ_t*)
-			ut_malloc_nokey(n_stored_fields * sizeof(mysql_row_templ_t));
+			ut_malloc_nokey(n_fields * sizeof(mysql_row_templ_t));
 	}
 
 	m_prebuilt->template_type = whole_row
@@ -8484,14 +8526,10 @@ ha_innobase::build_template(
 		ulint	num_v = 0;
 
 		/* Push down an index condition or an end_range check. */
-		for (i = 0, sql_idx = 0; i < n_stored_fields; i++, sql_idx++) {
+		for (i = 0; i < n_fields; i++) {
 			ibool		index_contains;
 
-			while (!table->field[sql_idx]->stored_in_db()) {
-				sql_idx++;
-			}
-
-			if (innobase_is_v_fld(table->field[sql_idx])) {
+			if (innobase_is_v_fld(table->field[i])) {
 				index_contains = dict_index_contains_col_or_prefix(
 					index, num_v, true);
 			} else {
@@ -8514,8 +8552,7 @@ ha_innobase::build_template(
 			the subset
 			field->part_of_key.is_set(active_index)
 			which would be acceptable if end_range==NULL. */
-			bool	is_v = innobase_is_v_fld(table->field[sql_idx]);
-
+			bool	is_v = innobase_is_v_fld(table->field[i]);
 			if (build_template_needs_field_in_icp(
 				    index, m_prebuilt, index_contains,
 				    is_v ? num_v : i - num_v, is_v)) {
@@ -8524,17 +8561,17 @@ ha_innobase::build_template(
 				mysql_row_templ_t*	templ;
 
 				if (whole_row) {
-					field = table->field[sql_idx];
+					field = table->field[i];
 				} else {
 					field = build_template_needs_field(
 						index_contains,
 						m_prebuilt->read_just_key,
 						fetch_all_in_key,
 						fetch_primary_key_cols,
-						index, table, i, sql_idx, num_v);
+						index, table, i, num_v);
 					if (!field) {
 						if (innobase_is_v_fld(
-							table->field[sql_idx])) {
+							table->field[i])) {
 							num_v++;
 						}
 						continue;
@@ -8616,7 +8653,7 @@ ha_innobase::build_template(
 				      < m_prebuilt->index->n_uniq);
 				*/
 			}
-			if (innobase_is_v_fld(table->field[sql_idx])) {
+			if (innobase_is_v_fld(table->field[i])) {
 				num_v++;
 			}
 		}
@@ -8628,15 +8665,11 @@ ha_innobase::build_template(
 
 		/* Include the fields that are not needed in index condition
 		pushdown. */
-		for (i = 0, sql_idx = 0; i < n_stored_fields; i++, sql_idx++) {
+		for (i = 0; i < n_fields; i++) {
 			mysql_row_templ_t*	templ;
 			ibool			index_contains;
 
-			while (!table->field[sql_idx]->stored_in_db()) {
-				sql_idx++;
-			}
-
-			if (innobase_is_v_fld(table->field[sql_idx])) {
+			if (innobase_is_v_fld(table->field[i])) {
 				index_contains = dict_index_contains_col_or_prefix(
 					index, num_v, true);
 			} else {
@@ -8644,7 +8677,7 @@ ha_innobase::build_template(
 					index, i - num_v, false);
 			}
 
-			bool	is_v = innobase_is_v_fld(table->field[sql_idx]);
+			bool	is_v = innobase_is_v_fld(table->field[i]);
 
 			if (!build_template_needs_field_in_icp(
 				    index, m_prebuilt, index_contains,
@@ -8653,16 +8686,16 @@ ha_innobase::build_template(
 				const Field*	field;
 
 				if (whole_row) {
-					field = table->field[sql_idx];
+					field = table->field[i];
 				} else {
 					field = build_template_needs_field(
 						index_contains,
 						m_prebuilt->read_just_key,
 						fetch_all_in_key,
 						fetch_primary_key_cols,
-						index, table, i, sql_idx, num_v);
+						index, table, i, num_v);
 					if (!field) {
-						if (innobase_is_v_fld(table->field[sql_idx])) {
+						if (innobase_is_v_fld(table->field[i])) {
 							num_v++;
 						}
 						continue;
@@ -8686,12 +8719,8 @@ ha_innobase::build_template(
 		/* No index condition pushdown */
 		m_prebuilt->idx_cond = NULL;
 
-		for (i = 0, sql_idx = 0; i < n_stored_fields; i++, sql_idx++) {
+		for (i = 0; i < n_fields; i++) {
 			const Field*	field;
-
-			while (!table->field[sql_idx]->stored_in_db()) {
-				sql_idx++;
-			}
 
 			if (whole_row) {
 				/* Even this is whole_row, if the seach is
@@ -8700,7 +8729,7 @@ ha_innobase::build_template(
 				will not try to fill the value since they
 				are not stored in such index nor in the
 				cluster index. */
-				if (innobase_is_v_fld(table->field[sql_idx])
+				if (innobase_is_v_fld(table->field[i])
 				    && m_prebuilt->read_just_key
 				    && !dict_index_contains_col_or_prefix(
 					m_prebuilt->index, num_v, true))
@@ -8712,11 +8741,11 @@ ha_innobase::build_template(
 					continue;
 				}
 
-				field = table->field[sql_idx];
+				field = table->field[i];
 			} else {
 				ibool	contain;
 
-				if (innobase_is_v_fld(table->field[sql_idx])) {
+				if (innobase_is_v_fld(table->field[i])) {
 					contain = dict_index_contains_col_or_prefix(
 						index, num_v, true);
 				} else {
@@ -8725,16 +8754,14 @@ ha_innobase::build_template(
 						false);
 				}
 
-
 				field = build_template_needs_field(
 					contain,
 					m_prebuilt->read_just_key,
 					fetch_all_in_key,
 					fetch_primary_key_cols,
-					index, table, i, sql_idx, num_v);
-
+					index, table, i, num_v);
 				if (!field) {
-					if (innobase_is_v_fld(table->field[sql_idx])) {
+					if (innobase_is_v_fld(table->field[i])) {
 						num_v++;
 					}
 					continue;
@@ -9356,7 +9383,7 @@ calc_row_difference(
 	ulint		n_changed = 0;
 	dfield_t	dfield;
 	dict_index_t*	clust_index;
-        uint		sql_idx,i, innodb_idx= 0;
+        uint		i;
 	ibool		changes_fts_column = FALSE;
 	ibool		changes_fts_doc_col = FALSE;
 	trx_t*		trx = thd_to_trx(thd);
@@ -9371,19 +9398,15 @@ calc_row_difference(
 	/* We use upd_buff to convert changed fields */
 	buf = (byte*) upd_buff;
 
-	for (sql_idx = 0,i=0; i < n_fields; i++, sql_idx++) {
-		field = table->field[sql_idx];
+	for (i = 0; i < n_fields; i++) {
+		field = table->field[i];
 		bool		is_virtual = innobase_is_v_fld(field);
 		dict_col_t*	col;
-
-		if (!field->stored_in_db()) {
-			continue;
-		}
 
 		if (is_virtual) {
 			col = &prebuilt->table->v_cols[num_v].m_col;
 		} else {
-			col = &prebuilt->table->cols[innodb_idx - num_v];
+			col = &prebuilt->table->cols[i - num_v];
 		}
 
 		o_ptr = (const byte*) old_row + get_field_offset(table, field);
@@ -9598,7 +9621,7 @@ calc_row_difference(
 				num_v++;
 			} else {
 				ufield->field_no = dict_col_get_clust_pos(
-					&prebuilt->table->cols[innodb_idx - num_v],
+					&prebuilt->table->cols[i - num_v],
 					clust_index);
 				ufield->old_v_val = NULL;
 			}
@@ -9643,10 +9666,6 @@ calc_row_difference(
 				col_pack_len, buf);
 			ut_ad(col->ord_part || online_ord_part);
 			num_v++;
-		}
-
-		if (field->stored_in_db()) {
-			innodb_idx++;
 		}
 	}
 
@@ -9725,7 +9744,7 @@ calc_row_difference(
 
 	ut_a(buf <= (byte*) original_upd_buff + buff_len);
 
-	ut_ad(uvect->validate());
+        ut_ad(uvect->validate());
 	return(DB_SUCCESS);
 }
 
@@ -9812,7 +9831,7 @@ wsrep_calc_row_hash(
 }
 #endif /* WITH_WSREP */
 
-/*
+/**
 Updates a row given as a parameter to a new value. Note that we are given
 whole rows, not just the fields which are updated: this incurs some
 overhead for CPU when we check which fields are actually updated.
@@ -9848,19 +9867,17 @@ ha_innobase::update_row(
 		ut_ad(m_upd_buf_size == 0);
 
 		/* Create a buffer for packing the fields of a record. Why
-		table->stored_rec_length did not work here? Obviously,
-		because char fields when packed actually became 1 byte
-		longer, when we also stored the string length as the first
-		byte. */
+		table->reclength did not work here? Obviously, because char
+		fields when packed actually became 1 byte longer, when we also
+		stored the string length as the first byte. */
 
-		m_upd_buf_size = table->s->stored_rec_length + table->s->max_key_length
+		m_upd_buf_size = table->s->reclength + table->s->max_key_length
 			+ MAX_REF_PARTS * 3;
 
 		m_upd_buf = reinterpret_cast<uchar*>(
-			my_malloc(
-				m_upd_buf_size,
+			my_malloc(//PSI_INSTRUMENT_ME,
+                                  m_upd_buf_size,
 				MYF(MY_WME)));
-		/* JAN: TODO: MySQL 5.7: PSI_INSTRUMENT_ME,...*/
 
 		if (m_upd_buf == NULL) {
 			m_upd_buf_size = 0;
@@ -10693,7 +10710,6 @@ ha_innobase::change_active_index(
 
 		/* If it's FTS query and FTS_DOC_ID exists FTS_DOC_ID field is
 		always added to read_set. */
-
 #ifdef MYSQL_STORE_FTS_DOC_ID
 		m_prebuilt->fts_doc_id_in_read_set =
 			(m_prebuilt->read_just_key && table->fts_doc_id_field
@@ -10730,7 +10746,6 @@ ha_innobase::general_fetch(
 	DBUG_ENTER("general_fetch");
 
 	const trx_t*	trx = m_prebuilt->trx;
-	dberr_t	ret;
 
 	ut_ad(trx == thd_to_trx(m_user_thd));
 
@@ -10745,6 +10760,8 @@ ha_innobase::general_fetch(
 	}
 
 	innobase_srv_conc_enter_innodb(m_prebuilt);
+
+	dberr_t	ret;
 
 	if (!intrinsic) {
 
@@ -11161,10 +11178,7 @@ ha_innobase::ft_init_ext(
 
 	/* Allocate FTS handler, and instantiate it before return */
 	fts_hdl = reinterpret_cast<NEW_FT_INFO*>(
-		my_malloc(sizeof(NEW_FT_INFO), MYF(0)));
-		/* JAN: TODO: MySQL 5.7 PSI
-		my_malloc(PSI_INSTRUMENT_ME, sizeof(NEW_FT_INFO), MYF(0)));
-		*/
+		my_malloc(/*PSI_INSTRUMENT_ME,*/ sizeof(NEW_FT_INFO), MYF(0)));
 
 	fts_hdl->please = const_cast<_ft_vft*>(&ft_vft_result);
 	fts_hdl->could_you = const_cast<_ft_vft_ext*>(&ft_vft_ext_result);
@@ -11943,7 +11957,28 @@ create_table_check_doc_id_col(
 	return(false);
 }
 
-#ifdef MYSQL_VIRTUAL_COLUMNS
+
+template <typename T> void
+prepare_vcol_for_base_setup(
+	const dict_table_t*	table,
+	const Field*	field,
+	T*		col)
+{
+        ut_ad(col->num_base == 0);
+        ut_ad(col->base_col == NULL);
+
+        bitmap_clear_all(&field->table->tmp_set);
+        field->vcol_info->expr_item->walk(
+                &Item::add_field_to_set_processor, 1, field->table);
+        col->num_base= bitmap_bits_set(&field->table->tmp_set);
+	if (col->num_base != 0) {
+		col->base_col = static_cast<dict_col_t**>(mem_heap_zalloc(
+					table->heap, col->num_base * sizeof(
+						*col->base_col)));
+	}
+}
+
+
 /** Set up base columns for virtual column
 @param[in]	table		InnoDB table
 @param[in]	field		MySQL field
@@ -11956,10 +11991,12 @@ innodb_base_col_setup(
 {
 	int     n = 0;
 
+        prepare_vcol_for_base_setup(table, field, v_col);
+
 	for (uint i= 0; i < field->table->s->fields; ++i) {
 		const Field* base_field = field->table->field[i];
-		if (!base_field->is_virtual_gcol()
-			&& bitmap_is_set(&field->gcol_info->base_columns_map, i)) {
+		if (base_field->stored_in_db()
+			&& bitmap_is_set(&field->table->tmp_set, i)) {
 			ulint   z;
 
 			for (z = 0; z < table->n_cols; z++) {
@@ -11977,10 +12014,9 @@ innodb_base_col_setup(
 			n++;
 		}
 	}
+        v_col->num_base= n;
 }
-#endif /* MYSQL_VIRTUAL_COLUMNS */
 
-#ifdef MYSQL_VIRTUAL_COLUMNS
 /** Set up base columns for stored column
 @param[in]	table	InnoDB table
 @param[in]	field	MySQL field
@@ -11993,12 +12029,14 @@ innodb_base_col_setup_for_stored(
 {
 	ulint	n = 0;
 
+        prepare_vcol_for_base_setup(table, field, s_col);
+
 	for (uint i= 0; i < field->table->s->fields; ++i) {
 		const Field* base_field = field->table->field[i];
 
 		if (!innobase_is_s_fld(base_field)
 		    && !innobase_is_v_fld(base_field)
-		    && bitmap_is_set(&field->gcol_info->base_columns_map,
+		    && bitmap_is_set(&field->table->tmp_set,
 				     i)) {
 			ulint	z;
 			for (z = 0; z < table->n_cols; z++) {
@@ -12020,8 +12058,8 @@ innodb_base_col_setup_for_stored(
 			}
 		}
 	}
+        s_col->num_base= n;
 }
-#endif
 
 /** Create a table definition to an InnoDB database.
 @return ER_* level error */
@@ -12031,7 +12069,7 @@ create_table_info_t::create_table_def()
 {
 	dict_table_t*	table;
 	ulint		n_cols;
-	ulint		s_cols;
+	dberr_t		err = DB_SUCCESS;
 	ulint		col_type;
 	ulint		col_len;
 	ulint		nulls_allowed;
@@ -12040,6 +12078,7 @@ create_table_info_t::create_table_def()
 	ulint		long_true_varchar;
 	ulint		charset_no;
 	ulint		i;
+	ulint		j = 0;
 	ulint		doc_id_col = 0;
 	ibool		has_doc_id_col = FALSE;
 	mem_heap_t*	heap;
@@ -12047,7 +12086,6 @@ create_table_info_t::create_table_def()
 	ulint		space_id = 0;
 	ulint		actual_n_cols;
 	ha_table_option_struct *options= m_form->s->option_struct;
-	dberr_t		err = DB_SUCCESS;
 
 	DBUG_ENTER("create_table_def");
 	DBUG_PRINT("enter", ("table_name: %s", m_table_name));
@@ -12076,9 +12114,7 @@ create_table_info_t::create_table_def()
 	}
 
 	n_cols = m_form->s->fields;
-	s_cols = m_form->s->stored_fields;
 
-#ifdef MYSQL_VIRTUAL_COLUMNS
 	/* Find out any virtual column */
 	for (i = 0; i < n_cols; i++) {
 		Field*	field = m_form->field[i];
@@ -12087,7 +12123,6 @@ create_table_info_t::create_table_def()
 			num_v++;
 		}
 	}
-#endif /* MYSQL_VIRTUAL_COLUMNS */
 
 	ut_ad(trx_state_eq(m_trx, TRX_STATE_NOT_STARTED));
 
@@ -12113,8 +12148,7 @@ create_table_info_t::create_table_def()
 	}
 
 	/* Adjust the number of columns for the FTS hidden field */
-	actual_n_cols = m_form->s->stored_fields;
-
+	actual_n_cols = n_cols;
 	if (m_flags2 & DICT_TF2_FTS && !has_doc_id_col) {
 		actual_n_cols += 1;
 	}
@@ -12125,7 +12159,7 @@ create_table_info_t::create_table_def()
 	/* Set the hidden doc_id column. */
 	if (m_flags2 & DICT_TF2_FTS) {
 		table->fts->doc_col = has_doc_id_col
-				      ? doc_id_col : s_cols;
+				      ? doc_id_col : n_cols - num_v;
 	}
 
 	if (strlen(m_temp_path) != 0) {
@@ -12154,12 +12188,9 @@ create_table_info_t::create_table_def()
 
 	for (i = 0; i < n_cols; i++) {
 		ulint	is_virtual;
-		bool	is_stored MY_ATTRIBUTE((unused));
-		Field*	field = m_form->field[i];
+		bool	is_stored = false;
 
-		if (!field->stored_in_db()) {
-			continue;
-		}
+		Field*	field = m_form->field[i];
 
 		/* Generate a unique column name by pre-pending table-name for
 		intrinsic tables. For other tables (including normal
@@ -12277,7 +12308,6 @@ err_col:
 					charset_no),
 				col_len);
 		} else {
-#ifdef MYSQL_VIRTUAL_COLUMNS
 			dict_mem_table_add_v_col(table, heap,
 				field_name, col_type,
 				dtype_form_prtype(
@@ -12286,26 +12316,18 @@ err_col:
 					| binary_type | long_true_varchar
 					| is_virtual,
 					charset_no),
-				col_len, i,
-				0);
+				col_len, i, 0);
+		}
 
-				field->gcol_info->non_virtual_base_columns());
-#endif
-	}
-
-#ifdef MYSQL_VIRTUAL_COLUMNS
 		if (is_stored) {
 			ut_ad(!is_virtual);
 			/* Added stored column in m_s_cols list. */
 			dict_mem_table_add_s_col(
-				table,
-				field->gcol_info->non_virtual_base_columns());
+				table, 0);
 		}
-#endif
 	}
-#ifdef MYSQL_VIRTUAL_COLUMNS
+
 	if (num_v) {
-		ulint		j = 0;
 		for (i = 0; i < n_cols; i++) {
 			dict_v_col_t*	v_col;
 
@@ -12346,7 +12368,6 @@ err_col:
 			}
 		}
 	}
-#endif /* MYSQL_VIRTUAL_COLUMNS */
 
 	/* Add the FTS doc_id hidden column. */
 	if (m_flags2 & DICT_TF2_FTS && !has_doc_id_col) {
@@ -12362,6 +12383,7 @@ err_col:
 	if (dict_table_is_temporary(table)) {
 #ifdef MYSQL_COMPRESSION
 		if (m_create_info->compress.length > 0) {
+
 			push_warning_printf(
 				m_thd,
 				Sql_condition::WARN_LEVEL_WARN,
@@ -12370,7 +12392,6 @@ err_col:
 				"temporary tables");
 
 			err = DB_UNSUPPORTED;
-
 			dict_mem_table_free(table);
 		} else if (m_create_info->encrypt_type.length > 0
 			   && !Encryption::is_none(
@@ -12379,7 +12400,6 @@ err_col:
 			my_error(ER_TABLESPACE_CANNOT_ENCRYPT, MYF(0));
 			err = DB_UNSUPPORTED;
 			dict_mem_table_free(table);
-			*/
 		} else {
 #endif /* MYSQL_COMPRESSION */
 			/* Get a new table ID */
@@ -12604,13 +12624,7 @@ create_index(
 		ind_type |= DICT_UNIQUE;
 	}
 
-	/* JAN: TODO: MySQL 5.7 PSI
-	field_lengths = (ulint*) my_malloc(PSI_INSTRUMENT_ME,
-		key->user_defined_key_parts * sizeof *
-				field_lengths, MYF(MY_FAE));
-	*/
-
-	field_lengths = (ulint*) my_malloc(
+	field_lengths = (ulint*) my_malloc(//PSI_INSTRUMENT_ME,
 		key->user_defined_key_parts * sizeof *
 				field_lengths, MYF(MY_FAE));
 
@@ -12886,8 +12900,7 @@ validate_tablespace_name(
 				err = HA_WRONG_CREATE_OPTION;
 			}
 		} else {
-			my_printf_error(
-				ER_WRONG_TABLESPACE_NAME,
+			my_printf_error(ER_WRONG_TABLESPACE_NAME,
 					"InnoDB: A general tablespace"
 					" name cannot start with `%s`.",
 					MYF(0), reserved_space_name_prefix);
@@ -13589,7 +13602,6 @@ create_table_info_t::parse_table_name(
 				WARN_OPTION_IGNORED,
 				ER_DEFAULT(WARN_OPTION_IGNORED),
 				"DATA DIRECTORY");
-
 			m_flags &= ~DICT_TF_MASK_DATA_DIR;
 		} else {
 			strncpy(m_remote_path,
@@ -13728,8 +13740,6 @@ index_bad:
 		}
 	}
 
-	//rec_format_t row_format = m_form->s->row_type;
-
 	if (m_create_info->key_block_size > 0) {
 		/* The requested compressed page size (key_block_size)
 		is given in kilobytes. If it is a valid number, store
@@ -13817,6 +13827,7 @@ index_bad:
 	case ROW_TYPE_COMPACT:
 		innodb_row_format = REC_FORMAT_COMPACT;
 		break;
+
 	case ROW_TYPE_COMPRESSED:
 		/* ROW_FORMAT=COMPRESSED requires file_per_table and
 		file_format=Barracuda unless there is a target tablespace. */
@@ -13883,22 +13894,19 @@ index_bad:
 
 	if (m_create_info->options & HA_LEX_CREATE_TMP_TABLE) {
 		m_flags2 |= DICT_TF2_TEMPORARY;
+
 		/* Intrinsic tables reside only in the shared temporary
 		tablespace and we will always use ROW_FORMAT=DYNAMIC. */
-
 #ifdef MYSQL_COMPRESSION
 		if ((m_create_info->options & HA_LEX_CREATE_INTERNAL_TMP_TABLE)
 		    && !m_use_file_per_table) {
-
 			/* We do not allow compressed instrinsic
 			temporary tables. */
-
 			ut_ad(zip_ssize == 0);
 			m_flags2 |= DICT_TF2_INTRINSIC;
 			innodb_row_format = REC_FORMAT_DYNAMIC;
 		}
 #endif
-
 	}
 
 	/* Set the table flags */
@@ -14150,14 +14158,14 @@ create_table_info_t::initialize()
 		DBUG_RETURN(HA_ERR_TOO_MANY_FIELDS);
 	}
 
+	ut_ad(m_form->s->row_type == m_create_info->row_type);
+
 	/* Check for name conflicts (with reserved name) for
 	any user indices to be created. */
 	if (innobase_index_name_is_reserved(m_thd, m_form->key_info,
 					    m_form->s->keys)) {
 		DBUG_RETURN(HA_ERR_WRONG_INDEX);
 	}
-
-	ut_ad(m_form->s->row_type == m_create_info->row_type);
 
 	/* Get the transaction associated with the current thd, or create one
 	if not yet created */
@@ -14239,7 +14247,6 @@ create_table_info_t::create_table()
 	ut_a(primary_key_no == -1 || primary_key_no == 0);
 
 	error = create_table_def();
-
 	if (error) {
 		DBUG_RETURN(error);
 	}
@@ -14389,19 +14396,15 @@ create_table_info_t::create_table()
 				" table where referencing columns appear"
 				" as the first columns.\n", m_table_name);
 			break;
-#ifdef MYSQL_VIRTUAL_COLUMNS
-		case DB_NO_FK_ON_V_BASE_COL:
+		case DB_NO_FK_ON_S_BASE_COL:
 			push_warning_printf(
 				m_thd, Sql_condition::WARN_LEVEL_WARN,
 				HA_ERR_CANNOT_ADD_FOREIGN,
 				"Create table '%s' with foreign key constraint"
 				" failed. Cannot add foreign key constraint"
-				" placed on the base column of indexed"
-				" virtual column, or constraint placed"
-				" on columns being part of virtual index.\n",
+				" placed on the base column of stored"
+				" column. \n",
 				m_table_name);
-			break;
-#endif
 		default:
 			break;
 		}
@@ -14442,7 +14445,6 @@ create_table_info_t::create_table_update_dict()
 
 	innobase_table = thd_to_innodb_session(m_thd)->lookup_table_handler(
 		m_table_name);
-
 
 	if (innobase_table == NULL) {
 		innobase_table = dict_table_open_on_name(
@@ -14710,6 +14712,7 @@ ha_innobase::discard_or_import_tablespace(
 	TrxInInnoDB	trx_in_innodb(m_prebuilt->trx);
 
 	if (trx_in_innodb.is_aborted()) {
+
 		innobase_rollback(ht, m_user_thd, false);
 
 		DBUG_RETURN(convert_error_code_to_mysql(
@@ -15070,8 +15073,7 @@ validate_create_tablespace_info(
 	THD*			thd,
 	st_alter_tablespace*	alter_info)
 {
-
-	int error = 0;
+	ulint	space_id;
 
 	/* The parser ensures that these fields are provided. */
 	ut_a(alter_info->tablespace_name);
@@ -15095,6 +15097,7 @@ validate_create_tablespace_info(
 				alter_info->tablespace_name);
 		error = HA_ERR_TABLESPACE_EXISTS;
 	}
+
 	if (alter_info->file_block_size) {
 		/* Check for a bad file block size. */
 		if (!ut_is_2pow(alter_info->file_block_size)
@@ -15142,7 +15145,6 @@ validate_create_tablespace_info(
 		ut_free(filepath);
 		return(HA_WRONG_CREATE_OPTION);
 	}
-
 	if (memcmp(&basename[basename_len - 4], DOT_IBD, 5)) {
 		my_error(ER_WRONG_FILE_NAME, MYF(0),
 			 alter_info->data_file_name);
@@ -15224,7 +15226,7 @@ innobase_create_tablespace(
 	st_alter_tablespace*	alter_info)
 {
 	trx_t*		trx;
-	int		error=0;
+	int		error;
 	Tablespace	tablespace;
 
 	DBUG_ENTER("innobase_create_tablespace");
@@ -15268,7 +15270,6 @@ innobase_create_tablespace(
 	if (zip_size == 0) {
 		zip_size = UNIV_PAGE_SIZE;
 	}
-
 	bool	zipped = (zip_size != UNIV_PAGE_SIZE);
 	page_size_t	page_size(zip_size, UNIV_PAGE_SIZE, zipped);
 	bool atomic_blobs = page_size.is_compressed();
@@ -15468,7 +15469,6 @@ innobase_alter_tablespace(
 @param[in]	path	Database path; Inside InnoDB the name of the last
 directory in the path is used as the database name.
 For example, in 'mysql/data/test' the database name is 'test'. */
-
 static
 void
 innobase_drop_database(
@@ -15508,9 +15508,7 @@ innobase_drop_database(
 	}
 
 	ptr++;
-	namebuf = (char*) my_malloc((uint) len + 2, MYF(0));
-	// JAN: TODO: MySQL 5.7
-	//namebuf = (char*) my_malloc(PSI_INSTRUMENT_ME, (uint) len + 2, MYF(0));
+	namebuf = (char*) my_malloc(/*PSI_INSTRUMENT_ME,*/ (uint) len + 2, MYF(0));
 
 	memcpy(namebuf, ptr, len);
 	namebuf[len] = '/';
@@ -15760,8 +15758,9 @@ For other error codes, the server will fall back to counting records. */
 
 #ifdef MYSQL_57_SELECT_COUNT_OPTIMIZATION
 int
-ha_innobase::records(ha_rows* num_rows)
-/*===================================*/
+ha_innobase::records(
+/*==================*/
+	ha_rows*			num_rows) /*!< out: number of rows */
 {
 	DBUG_ENTER("ha_innobase::records()");
 
@@ -15833,16 +15832,15 @@ ha_innobase::records(ha_rows* num_rows)
 	case DB_LOCK_WAIT_TIMEOUT:
 		*num_rows = HA_POS_ERROR;
 		DBUG_RETURN(convert_error_code_to_mysql(ret, 0, m_user_thd));
-		break;
 	case DB_INTERRUPTED:
 		*num_rows = HA_POS_ERROR;
 		DBUG_RETURN(HA_ERR_QUERY_INTERRUPTED);
-		break;
 	default:
 		/* No other error besides the three below is returned from
 		row_scan_index_for_mysql(). Make a debug catch. */
 		*num_rows = HA_POS_ERROR;
 		ut_ad(0);
+		DBUG_RETURN(-1);
 	}
 
 	m_prebuilt->trx->op_info = "";
@@ -15852,6 +15850,7 @@ ha_innobase::records(ha_rows* num_rows)
 		DBUG_RETURN(HA_ERR_QUERY_INTERRUPTED);
 	}
 
+	*num_rows= n_rows;
 	DBUG_RETURN(0);
 }
 #endif /* MYSQL_57_SELECT_COUNT_OPTIMIZATION */
@@ -16068,6 +16067,7 @@ ha_innobase::scan_time()
 	it we could end up returning uninitialized value to the caller,
 	which in the worst case could make some query plan go bogus or
 	issue a Valgrind warning. */
+
 	if (m_prebuilt == NULL) {
 		/* In case of derived table, Optimizer will try to fetch stat
 		for table even before table is create or open. In such
@@ -16484,8 +16484,7 @@ ha_innobase::info_low(
 				char	errbuf[MYSYS_STRERROR_SIZE];
 
 				thd = ha_thd();
-				my_strerror(errbuf, sizeof(errbuf),
-					    errno);
+
 				push_warning_printf(
 					thd,
 					Sql_condition::WARN_LEVEL_WARN,
@@ -16497,8 +16496,8 @@ ha_innobase::info_low(
 					" the free space to zero."
 					" (errno: %d - %s)",
 					ib_table->name.m_name, errno,
-					errbuf);
-
+					my_strerror(errbuf, sizeof(errbuf),
+						    errno));
 
 				stats.delete_length = 0;
 			} else {
@@ -16569,7 +16568,6 @@ ha_innobase::info_low(
 
 		for (i = 0; i < table->s->keys; i++) {
 			ulong	j;
-
 			/* We could get index quickly through internal
 			index mapping with the index translation table.
 			The identity of index (match up index name with
@@ -16589,7 +16587,6 @@ ha_innobase::info_low(
 
 				if ((key->flags & HA_FULLTEXT)
 				    || (key->flags & HA_SPATIAL)) {
-
 					/* The record per key does not apply to
 					FTS or Spatial indexes. */
 				/*
@@ -17189,7 +17186,6 @@ ha_innobase::check(
 			dict_set_corrupted(
 				index, m_prebuilt->trx, "CHECK TABLE-check index");
 		}
-
 
 		if (index == dict_table_get_first_index(m_prebuilt->table)) {
 			n_rows_in_table = n_rows;
@@ -18393,12 +18389,8 @@ innodb_show_status(
 	/* allocate buffer for the string, and
 	read the contents of the temporary file */
 
-	/* JAN: TODO: MySQL 5.7 PSI */
-	if (!(str = (char*) my_malloc(
+	if (!(str = (char*) my_malloc(//PSI_INSTRUMENT_ME,
 				usable_len + 1, MYF(0)))) {
-		/*	if (!(str = (char*) my_malloc(PSI_INSTRUMENT_ME,
-				usable_len + 1, MYF(0)))) {
-		*/
 		mutex_exit(&srv_monitor_file_mutex);
 		DBUG_RETURN(1);
 	}
@@ -18833,15 +18825,9 @@ get_share(
 		grows too big */
 
 		share = reinterpret_cast<INNOBASE_SHARE*>(
-			my_malloc(
+			my_malloc(//PSI_INSTRUMENT_ME,
 				  sizeof(*share) + length + 1,
 				  MYF(MY_FAE | MY_ZEROFILL)));
-		/* JAN: TODO: MySQL 5.7 PSI
-		share = reinterpret_cast<INNOBASE_SHARE*>(
-			my_malloc(PSI_INSTRUMENT_ME,
-				  sizeof(*share) + length + 1,
-				  MYF(MY_FAE | MY_ZEROFILL)));
-		*/
 
 		share->table_name = reinterpret_cast<char*>(
 			memcpy(share + 1, table_name, length + 1));
@@ -19182,7 +19168,7 @@ ha_innobase::store_lock(
 	}
 
 #ifdef UNIV_DEBUG
-	if (trx->is_dd_trx) {
+	if(trx->is_dd_trx) {
 		ut_ad(trx->will_lock == 0
 		      && m_prebuilt->select_lock_type == LOCK_NONE);
 	}
@@ -19561,6 +19547,7 @@ ha_innobase::register_query_cache_table(
 	ulonglong	*engine_data)	/*!< in/out: data to call_back */
 {
 	*engine_data = 0;
+
 	*call_back = innobase_query_caching_of_table_permitted;
 
 	return(innobase_query_caching_of_table_permitted(
@@ -19824,64 +19811,6 @@ innobase_rollback_by_xid(
 	}
 }
 
-#ifdef INNOBASE_CURSOR_VIEW
-
-/*******************************************************************//**
-Create a consistent view for a cursor based on current transaction
-which is created if the corresponding MySQL thread still lacks one.
-This consistent view is then used inside of MySQL when accessing records
-using a cursor.
-@return	pointer to cursor view or NULL */
-static
-void*
-innobase_create_cursor_view(
-/*========================*/
-	handlerton*	hton,	/*!< in: innobase hton */
-	THD*		thd)	/*!< in: user thread handle */
-{
-	DBUG_ASSERT(hton == innodb_hton_ptr);
-
-	return(read_cursor_view_create_for_mysql(check_trx_exists(thd)));
-}
-
-/*******************************************************************//**
-Close the given consistent cursor view of a transaction and restore
-global read view to a transaction read view. Transaction is created if the
-corresponding MySQL thread still lacks one. */
-static
-void
-innobase_close_cursor_view(
-/*=======================*/
-	handlerton*	hton,	/*!< in: innobase hton */
-	THD*		thd,	/*!< in: user thread handle */
-	void*		curview)/*!< in: Consistent read view to be closed */
-{
-	DBUG_ASSERT(hton == innodb_hton_ptr);
-
-	read_cursor_view_close_for_mysql(check_trx_exists(thd),
-					 (cursor_view_t*) curview);
-}
-
-/*******************************************************************//**
-Set the given consistent cursor view to a transaction which is created
-if the corresponding MySQL thread still lacks one. If the given
-consistent cursor view is NULL global read view of a transaction is
-restored to a transaction read view. */
-static
-void
-innobase_set_cursor_view(
-/*=====================*/
-	handlerton*	hton,	/*!< in: innobase hton */
-	THD*		thd,	/*!< in: user thread handle */
-	void*		curview)/*!< in: Consistent cursor view to be set */
-{
-	DBUG_ASSERT(hton == innodb_hton_ptr);
-
-	read_cursor_set_for_mysql(check_trx_exists(thd),
-				  (cursor_view_t*) curview);
-}
-#endif /* INNOBASE_CURSOR_VIEW */
-
 bool
 ha_innobase::check_if_incompatible_data(
 /*====================================*/
@@ -19981,7 +19910,6 @@ innodb_io_capacity_update(
 						from check function */
 {
 	ulong	in_val = *static_cast<const ulong*>(save);
-
 	if (in_val > srv_max_io_capacity) {
 		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
 				    ER_WRONG_ARGUMENTS,
@@ -20198,7 +20126,6 @@ innodb_file_format_name_update(
 	ut_a(var_ptr != NULL);
 	ut_a(save != NULL);
 
-
 	push_warning(thd, Sql_condition::WARN_LEVEL_WARN,
 		     HA_ERR_WRONG_COMMAND, deprecated_file_format);
 
@@ -20294,7 +20221,6 @@ innodb_file_format_max_update(
 
 	ut_a(save != NULL);
 	ut_a(var_ptr != NULL);
-
 
 	push_warning(thd, Sql_condition::WARN_LEVEL_WARN,
 		     HA_ERR_WRONG_COMMAND, deprecated_file_format_max);
@@ -21035,12 +20961,8 @@ innodb_monitor_validate(
 	by InnoDB, so we can access it in another callback
 	function innodb_monitor_update() and free it appropriately */
 	if (name) {
-		/* JAN: TODO: MySQL 5.7 PSI
-		monitor_name = my_strdup(PSI_INSTRUMENT_ME,
+		monitor_name = my_strdup(//PSI_INSTRUMENT_ME,
                                          name, MYF(0));
-		*/
-		monitor_name = my_strdup(
-					name, MYF(0));
 	} else {
 		return(1);
 	}
@@ -22364,7 +22286,7 @@ static MYSQL_SYSVAR_ENUM(checksum_algorithm, srv_checksum_algorithm,
     " write a constant magic number, do not allow values other than that"
     " magic number when reading;"
   " Files updated when this option is set to crc32 or strict_crc32 will"
-  " not be readable by InnoDB versions older than 5.6.3",
+  " not be readable by MariaDB versions older than 10.0.4",
   NULL, NULL, SRV_CHECKSUM_ALGORITHM_CRC32,
   &innodb_checksum_algorithm_typelib);
 
@@ -23970,9 +23892,8 @@ innobase_index_cond(
 	return handler_index_cond_check(file);
 }
 
-#ifdef MYSQL_VIRTUAL_COLUMNS
 /** Get the computed value by supplying the base column values.
-@param[in,out]	table	the table whose virtual column template to be built */
+@param[in,out]	table	table whose virtual column template to be built */
 void
 innobase_init_vc_templ(
 	dict_table_t*	table)
@@ -23985,11 +23906,7 @@ innobase_init_vc_templ(
 	char    t_dbname[MAX_DATABASE_NAME_LEN + 1];
 	char    t_tbname[MAX_TABLE_NAME_LEN + 1];
 
-	mutex_enter(&dict_sys->mutex);
-
 	if (table->vc_templ != NULL) {
-		mutex_exit(&dict_sys->mutex);
-
 		return;
 	}
 
@@ -24015,18 +23932,18 @@ innobase_init_vc_templ(
 	tbnamelen = filename_to_tablename(tbname, t_tbname,
 					  MAX_TABLE_NAME_LEN + 1);
 
-#ifdef UNIV_DEBUG
-	//	bool ret =
-#endif /* UNIV_DEBUG */
+        TABLE_LIST table_list;
+        table_list.init_one_table(t_dbname, dbnamelen,
+                                  t_tbname, tbnamelen, t_tbname, TL_READ);
+        TABLE_SHARE *share= tdc_acquire_share(current_thd, &table_list,
+                                              GTS_TABLE);
+        ut_ad(share);
 
-	/* JAN: TODO: MySQL: 5.7 virtual columsn
-	handler::my_prepare_gcolumn_template(
-		thd, t_dbname, t_tbname,
-		&innobase_build_v_templ_callback,
-		static_cast<void*>(table));
-	ut_ad(!ret);
-	*/
+	mutex_enter(&dict_sys->mutex);
+	innobase_build_v_templ(share, table, table->vc_templ, NULL, true);
 	mutex_exit(&dict_sys->mutex);
+
+        tdc_release_share(share);
 }
 
 /** Change dbname and table name in table->vc_templ.
@@ -24141,6 +24058,8 @@ innobase_get_computed_value(
 	byte*		buf;
 	dfield_t*	field;
 	ulint		len;
+        my_bitmap_map   *old_write_set=dbug_tmp_use_all_columns(mysql_table, mysql_table->write_set);
+        my_bitmap_map   *old_read_set=dbug_tmp_use_all_columns(mysql_table, mysql_table->read_set);
 
 	const page_size_t page_size = (old_table == NULL)
 		? dict_table_page_size(index->table)
@@ -24169,6 +24088,9 @@ innobase_get_computed_value(
 		mysql_rec = rec_buf1;
 		buf = rec_buf2;
 	}
+
+        if (mysql_table)
+          mysql_rec= mysql_table->record[0];
 
 	for (ulint i = 0; i < col->num_base; i++) {
 		dict_col_t*			base_col = col->base_col[i];
@@ -24228,16 +24150,6 @@ innobase_get_computed_value(
 
 	field = dtuple_get_nth_v_field(row, col->v_pos);
 
-	/* Bitmap for specifying which virtual columns the server
-	should evaluate */
-	MY_BITMAP	column_map;
-	my_bitmap_map	col_map_storage[bitmap_buffer_size(REC_MAX_N_FIELDS)];
-
-	bitmap_init(&column_map, col_map_storage, REC_MAX_N_FIELDS, false);
-
-	/* Specify the column the server should evaluate */
-	bitmap_set_bit(&column_map, col->m_col.ind);
-
 	if (mysql_table == NULL) {
 		if (vctempl->type == DATA_BLOB) {
 			ulint	max_len;
@@ -24259,14 +24171,18 @@ innobase_get_computed_value(
 				vctempl->mysql_col_len, blob_mem, max_len);
                 }
 
-		ret = handler::my_eval_gcolumn_expr_with_open(
+                ut_a(0);
+		ret = 1; /*handler::my_eval_gcolumn_expr_with_open(
 			thd, index->table->vc_templ->db_name.c_str(),
-			index->table->vc_templ->tb_name.c_str(), &column_map,
-			(uchar *)mysql_rec);
+			index->table->vc_templ->tb_name.c_str(), col->m_col.ind,
+			(uchar *)mysql_rec); MYSQL_VIRTUAL_COLUMNS*/
+                ut_ad(0);
         } else {
-		ret = handler::my_eval_gcolumn_expr(
-			thd, mysql_table, &column_map,
-			(uchar *)mysql_rec);
+                Field *vf= mysql_table->field[col->m_col.ind];
+                vf->vcol_info->expr_item->save_in_field(vf, 0);
+                dbug_tmp_restore_column_map(mysql_table->read_set, old_read_set);
+                dbug_tmp_restore_column_map(mysql_table->write_set, old_write_set);
+		ret = 0;
 	}
 
 	if (ret != 0) {
@@ -24323,7 +24239,6 @@ innobase_get_computed_value(
 
 	return(field);
 }
-#endif /* MYSQL_VIRTUAL_COLUMNS */
 
 /** Attempt to push down an index condition.
 @param[in] keyno MySQL key number

@@ -52,7 +52,6 @@ struct fts_string_t;
 #undef MYSQL_SPATIAL_INDEX
 #undef MYSQL_STORE_FTS_DOC_ID
 #undef MYSQL_TABLESPACES
-#undef MYSQL_VIRTUAL_COLUMNS
 
 /*********************************************************************//**
 Wrapper around MySQL's copy_and_convert function.

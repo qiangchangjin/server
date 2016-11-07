@@ -1439,9 +1439,6 @@ struct dict_vcol_templ_t {
 	/** table name */
 	std::string		tb_name;
 
-	/** share->table_name */
-	std::string		share_name;
-
 	/** MySQL record length */
 	ulint			rec_len;
 
