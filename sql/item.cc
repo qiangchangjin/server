@@ -907,7 +907,7 @@ bool Item_field::register_field_in_read_map(void *arg)
   {
     /* Ensure that the virtual fields is updated on read or write */
     bitmap_set_bit(field->table->vcol_set, field->field_index);
-    return field->vcol_info->expr_item->walk(&Item::register_field_in_read_map,
+    return field->vcol_info->expr->walk(&Item::register_field_in_read_map,
                                              1, arg);
   }
   return 0;
@@ -8520,7 +8520,7 @@ bool Item_default_value::fix_fields(THD *thd, Item **items)
   {
     fix_session_vcol_expr_for_read(thd, field, field->default_value);
     if (thd->mark_used_columns != MARK_COLUMNS_NONE)
-      field->default_value->expr_item->walk(&Item::register_field_in_read_map, 1, 0);
+      field->default_value->expr->walk(&Item::register_field_in_read_map, 1, 0);
     IF_DBUG(def_field->is_stat_field=1,); // a hack to fool ASSERT_COLUMN_MARKED_FOR_WRITE_OR_COMPUTED
   }
   return FALSE;
@@ -10315,9 +10315,9 @@ void Item::register_in(THD *thd)
 
 void Virtual_column_info::print(String *str)
 {
-  expr_item->print(str, (enum_query_type)(QT_ITEM_ORIGINAL_FUNC_NULLIF |
-                   QT_ITEM_IDENT_SKIP_DB_NAMES |
-                   QT_ITEM_IDENT_SKIP_TABLE_NAMES |
-                   QT_ITEM_CACHE_WRAPPER_SKIP_DETAILS |
-                   QT_TO_SYSTEM_CHARSET));
+  expr->print(str, (enum_query_type)(QT_ITEM_ORIGINAL_FUNC_NULLIF |
+                                     QT_ITEM_IDENT_SKIP_DB_NAMES |
+                                     QT_ITEM_IDENT_SKIP_TABLE_NAMES |
+                                     QT_ITEM_CACHE_WRAPPER_SKIP_DETAILS |
+                                     QT_TO_SYSTEM_CHARSET));
 }

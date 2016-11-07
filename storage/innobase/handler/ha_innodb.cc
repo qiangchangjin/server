@@ -11968,7 +11968,7 @@ prepare_vcol_for_base_setup(
         ut_ad(col->base_col == NULL);
 
         bitmap_clear_all(&field->table->tmp_set);
-        field->vcol_info->expr_item->walk(
+        field->vcol_info->expr->walk(
                 &Item::add_field_to_set_processor, 1, field->table);
         col->num_base= bitmap_bits_set(&field->table->tmp_set);
 	if (col->num_base != 0) {
@@ -24179,7 +24179,7 @@ innobase_get_computed_value(
                 ut_ad(0);
         } else {
                 Field *vf= mysql_table->field[col->m_col.ind];
-                vf->vcol_info->expr_item->save_in_field(vf, 0);
+                vf->vcol_info->expr->save_in_field(vf, 0);
                 dbug_tmp_restore_column_map(mysql_table->read_set, old_read_set);
                 dbug_tmp_restore_column_map(mysql_table->write_set, old_write_set);
 		ret = 0;

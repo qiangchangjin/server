@@ -2447,11 +2447,11 @@ TABLE *Delayed_insert::get_local_table(THD* client_thd)
     (*field)->orig_table= copy;			// Remove connection
     (*field)->move_field_offset(adjust_ptrs);	// Point at copy->record[0]
     if ((*field)->vcol_info)
-      (*field)->vcol_info->expr_item= NULL;
+      (*field)->vcol_info->expr= NULL;
     if ((*field)->default_value)
-      (*field)->default_value->expr_item= NULL;
+      (*field)->default_value->expr= NULL;
     if ((*field)->check_constraint)
-      (*field)->check_constraint->expr_item= NULL;
+      (*field)->check_constraint->expr= NULL;
     if (*org_field == found_next_number_field)
       (*field)->table->found_next_number_field= *field;
   }
