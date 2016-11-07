@@ -3344,45 +3344,6 @@ mysql_prepare_create_table(THD *thd, HA_CREATE_INFO *create_info,
     if (prepare_blob_field(thd, sql_field))
       DBUG_RETURN(TRUE);
 
-    if (sql_field->default_value)
-    {
-      Virtual_column_info *def= sql_field->default_value;
-
-      if (!sql_field->has_default_expression())
-        def->expr_str= null_lex_str;
-
-      if (!def->expr_item->basic_const_item() && !def->flags)
-      {
-        Item *expr= def->expr_item;
-        int err= !expr->fixed && // may be already fixed if ALTER TABLE
-                  expr->fix_fields(thd, &expr);
-        if (!err)
-        {
-          if (expr->result_type() == REAL_RESULT)
-          { // don't convert floats to string and back, it can be lossy
-            double res= expr->val_real();
-            if (expr->null_value)
-              expr= new (thd->mem_root) Item_null(thd);
-            else
-              expr= new (thd->mem_root) Item_float(thd, res, expr->decimals);
-          }
-          else
-          {
-            StringBuffer<MAX_FIELD_WIDTH> buf;
-            String *res= expr->val_str(&buf);
-            if (expr->null_value)
-              expr= new (thd->mem_root) Item_null(thd);
-            else
-            {
-              char *str= (char*) thd->strmake(res->ptr(), res->length());
-              expr= new (thd->mem_root) Item_string(thd, str, res->length(), res->charset());
-            }
-          }
-          thd->change_item_tree(&def->expr_item, expr);
-        }
-      }
-    }
-
     /*
       Convert the default value from client character
       set into the column character set if necessary.
@@ -4215,8 +4176,7 @@ mysql_prepare_create_table(THD *thd, HA_CREATE_INFO *create_info,
         my_error(ER_TOO_LONG_IDENT, MYF(0), key->name.str);
         DBUG_RETURN(TRUE);
       }
-      if (check_expression(check, "CONSTRAINT CHECK",
-                           check->name.str ? check->name.str : "", 0))
+      if (check_expression(check, VCOL_CHECK_TABLE))
         DBUG_RETURN(TRUE);
     }
   }

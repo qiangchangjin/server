@@ -2636,6 +2636,7 @@ public:
   bool switch_to_nullable_fields_processor(void *arg);
   bool check_vcol_func_processor(void *arg)
   {
+    context= 0;
     return mark_unsupported_function(field_name, arg, VCOL_FIELD_REF);
   }
   void cleanup();
@@ -5730,5 +5731,13 @@ public:
   }
   void close() {}
 };
+
+
+inline bool Virtual_column_info::is_equal(const Virtual_column_info* vcol) const
+{
+  return field_type == vcol->get_real_type()
+      && stored_in_db == vcol->is_stored()
+      && expr_item->eq(vcol->expr_item, true);
+}
 
 #endif /* SQL_ITEM_INCLUDED */

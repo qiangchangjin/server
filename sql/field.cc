@@ -4956,8 +4956,8 @@ Field_timestamp::Field_timestamp(uchar *ptr_arg, uint32 len_arg,
       this field will be automaticly updated on insert.
     */
     flags|= TIMESTAMP_FLAG;
-    flags|= ON_UPDATE_NOW_FLAG;
-    DBUG_ASSERT(unireg_check == TIMESTAMP_UN_FIELD);
+    if (unireg_check != TIMESTAMP_DN_FIELD)
+      flags|= ON_UPDATE_NOW_FLAG;
   }
 }
 
@@ -9775,18 +9775,10 @@ void Column_definition::create_length_to_internal_length(void)
 }
 
 
-bool check_expression(Virtual_column_info *vcol, const char *type,
-                      const char *name, bool must_be_determinstic)
+bool check_expression(Virtual_column_info *vcol, enum_vcol_info_type type)
 {
   bool ret;
   Item::vcol_func_processor_result res;
-  /* We use 2 bytes to store the expression length */
-  if (vcol->expr_str.length > UINT_MAX32)
-  {
-    my_error(ER_EXPRESSION_IS_TOO_BIG, MYF(0), type, name);
-    return TRUE;
-  }
-
   /*
     Walk through the Item tree checking if all items are valid
     to be part of the virtual column
@@ -9797,13 +9789,13 @@ bool check_expression(Virtual_column_info *vcol, const char *type,
   vcol->flags= res.errors;
 
   uint filter= VCOL_IMPOSSIBLE;
-  if (must_be_determinstic)
+  if (type != VCOL_GENERATED_VIRTUAL && type != VCOL_DEFAULT)
     filter|= VCOL_NOT_STRICTLY_DETERMINISTIC;
 
   if (ret || (res.errors & filter))
   {
     my_error(ER_VIRTUAL_COLUMN_FUNCTION_IS_NOT_ALLOWED, MYF(0), res.name,
-             type, name);
+             vcol_type_name(type), vcol->name.str);
     return TRUE;
   }
   /*
@@ -9828,20 +9820,28 @@ bool Column_definition::check(THD *thd)
   {
     DBUG_ASSERT(vcol_info->expr_item);
     vcol_info->set_field_type(sql_type);
-    if (check_expression(vcol_info, "GENERATED ALWAYS AS", field_name,
-                         vcol_info->stored_in_db))
+    if (!vcol_info->name.length)
+      vcol_info->name.str= const_cast<char*>(field_name);
+    if (check_expression(vcol_info, vcol_info->stored_in_db
+                         ? VCOL_GENERATED_STORED : VCOL_GENERATED_VIRTUAL))
       DBUG_RETURN(TRUE);
   }
 
-  if (check_constraint &&
-      check_expression(check_constraint, "CHECK", field_name, 0))
-    DBUG_RETURN(1);
+  if (check_constraint)
+  {
+    if (!check_constraint->name.length)
+      check_constraint->name.str= const_cast<char*>(field_name);
+    if (check_expression(check_constraint, VCOL_CHECK_FIELD))
+      DBUG_RETURN(1);
+  }
 
   if (default_value)
   {
     Item *def_expr= default_value->expr_item;
 
-    if (check_expression(default_value, "DEFAULT", field_name, 0))
+    if (!default_value->name.length)
+      default_value->name.str= const_cast<char*>(field_name);
+    if (check_expression(default_value, VCOL_DEFAULT))
       DBUG_RETURN(TRUE);
 
     /* Constant's are stored in the 'empty_record', except for blobs */
@@ -10558,8 +10558,8 @@ Column_definition::Column_definition(THD *thd, Field *old_field,
   if (!(flags & (NO_DEFAULT_VALUE_FLAG | BLOB_FLAG)) &&
       old_field->ptr != NULL && orig_field != NULL)
   {
-    if (orig_field->has_update_default_function())
-      unireg_check= Field::TIMESTAMP_UN_FIELD;
+    if (orig_field->unireg_check != Field::NEXT_NUMBER)
+      unireg_check= orig_field->unireg_check;
 
     /* Get the value from default_values */
     const uchar *dv= orig_field->table->s->default_values;
@@ -10569,8 +10569,6 @@ Column_definition::Column_definition(THD *thd, Field *old_field,
       String *res= orig_field->val_str(&tmp, orig_field->ptr_in_record(dv));
       char *pos= (char*) thd->strmake(res->ptr(), res->length());
       default_value= new (thd->mem_root) Virtual_column_info();
-      default_value->expr_str.str= pos;
-      default_value->expr_str.length= res->length();
       default_value->expr_item=
         new (thd->mem_root) Item_string(thd, pos, res->length(), charset);
       default_value->utf8= 0;
