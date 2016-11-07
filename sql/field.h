@@ -1175,6 +1175,11 @@ public:
     ptr=ptr_arg; null_ptr=null_ptr_arg; null_bit=null_bit_arg;
   }
   inline void move_field(uchar *ptr_arg) { ptr=ptr_arg; }
+  inline uchar *record_ptr() // record[0] or wherever the field was moved to
+  {
+    my_ptrdiff_t offset= table->s->field[field_index]->ptr - table->s->default_values;
+    return ptr - offset;
+  }
   virtual void move_field_offset(my_ptrdiff_t ptr_diff)
   {
     ptr=ADD_TO_PTR(ptr,ptr_diff, uchar*);
@@ -3314,7 +3319,8 @@ public:
   uint packed_col_length(const uchar *col_ptr, uint length);
   uint max_packed_col_length(uint max_length);
   void free() { value.free(); }
-  inline void clear_temporary() { bzero((uchar*) &value,sizeof(value)); }
+  inline void clear_temporary() { bzero((uchar*) &value, sizeof(value)); }
+  inline bool owns_ptr(uchar* p) { return p == (uchar*)value.ptr(); }
   uint size_of() const { return sizeof(*this); }
   bool has_charset(void) const
   { return charset() == &my_charset_bin ? FALSE : TRUE; }

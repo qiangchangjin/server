@@ -1190,6 +1190,8 @@ int chk_data_link(HA_CHECK *param, MI_INFO *info, my_bool extend)
       DBUG_ASSERT(0);                           /* Impossible */
       break;
     } /* switch */
+    if (param->fix_record)
+      param->fix_record(info, record);
     if (! got_error)
     {
       intern_record_checksum+=(ha_checksum) start_recpos;
@@ -3646,6 +3648,8 @@ static int sort_get_next_record(MI_SORT_PARAM *sort_param)
 finish:
   if (sort_param->calc_checksum)
     param->glob_crc+= info->checksum;
+  if (param->fix_record)
+    param->fix_record(info, sort_param->record);
   DBUG_RETURN(0);
 }
 
